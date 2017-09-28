@@ -51,9 +51,9 @@ def test_blame_by_percent(builtin_mock):
     assert 'EMAIL' in out
 
 
-def test_blame_by_git(builtin_mock, capfd):
+def test_blame_by_git(builtin_mock, capsys):
     """Sanity check the blame command to make sure it works."""
-    with capfd.disabled():
+    with capsys.disabled():
         out = blame('--git', 'mpich')
     assert 'Mpich' in out
     assert 'mock_packages' in out
