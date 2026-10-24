@@ -17,6 +17,7 @@ from contextlib import contextmanager
 import pytest
 
 import spack.binary_distribution
+import spack.config
 import spack.database
 import spack.deptypes as dt
 import spack.environment as ev
@@ -24,6 +25,8 @@ import spack.error
 import spack.oci.opener
 import spack.spec
 import spack.traverse
+import spack.util.cosign
+import spack.util.executable
 from spack.database import Database
 from spack.main import SpackCommand
 from spack.oci.image import Digest, ImageReference, default_config, default_manifest
@@ -317,12 +320,14 @@ def test_best_effort_upload(mutable_database: spack.database.Database, monkeypat
             raise Exception("Blob Server Error")
         return _push_blob(image_ref, spec, tmpdir)
 
-    def put_manifest(base_images, checksums, image_ref, tmpdir, extra_config, annotations, *specs):
+    def put_manifest(
+        base_images, checksums, image_ref, tmpdir, extra_config, annotations, *specs, **kwargs
+    ):
         # fail to upload the manifest of libdwarf
         if "libdwarf" in (s.name for s in specs):
             raise Exception("Manifest Server Error")
         return _push_manifest(
-            base_images, checksums, image_ref, tmpdir, extra_config, annotations, *specs
+            base_images, checksums, image_ref, tmpdir, extra_config, annotations, *specs, **kwargs
         )
 
     monkeypatch.setattr(spack.binary_distribution, "_oci_push_pkg_blob", push_blob)
@@ -386,3 +391,86 @@ def test_best_effort_upload(mutable_database: spack.database.Database, monkeypat
 
             # Test with issubset, cause we don't have the blob of libdwarf as it has no manifest.
             assert expected_digests and expected_digests.issubset(pkg_to_all_digests[s.name])
+
+
+class _RecordingCosign:
+    def __init__(self):
+        self.signed = []
+
+    def __call__(self, *args, **kwargs):
+        if args[0] == "sign":
+            self.signed.append(args[-1])
+
+
+@pytest.fixture
+def recording_cosign(monkeypatch):
+    fake = _RecordingCosign()
+    monkeypatch.setattr(spack.util.cosign, "_COSIGN", fake)
+    return fake
+
+
+def test_buildcache_push_signs_manifest_digests(mutable_database, recording_cosign):
+    """Every pushed spec image is signed by digest, using the key from the mirror config."""
+    registry = InMemoryOCIRegistry("example.com")
+    with oci_servers(registry):
+        spack.config.CONFIG.set(
+            "mirrors:oci-test",
+            {
+                "url": "oci://example.com/image",
+                "signed": {"method": "cosign", "key": "cosign.key"},
+            },
+            scope="user",
+        )
+        buildcache("push", "oci-test", "mpileaks^mpich")
+
+    # One signature per pushed spec image (tagged `*.spack`)
+    spec_tags = [tag for (_, tag) in registry.manifests if tag.endswith(".spack")]
+    assert len(spec_tags) > 1
+    assert len(recording_cosign.signed) == len(spec_tags)
+
+    # The signed references are the digests of the manifests that were pushed, as opposed to
+    # tags, which may be moved after signing
+    expected = {
+        "sha256:" + hashlib.sha256(json.dumps(m, separators=(",", ":")).encode()).hexdigest()
+        for (_, tag), m in registry.manifests.items()
+        if tag.endswith(".spack")
+    }
+    signed = {ref.split("@")[1] for ref in recording_cosign.signed}
+    assert signed == expected
+    assert all(ref.startswith("example.com/image@sha256:") for ref in recording_cosign.signed)
+
+
+def test_buildcache_push_cosign_key_override(mutable_database, recording_cosign):
+    with oci_servers(InMemoryOCIRegistry("example.com")):
+        mirror("add", "oci-test", "oci://example.com/image")
+        buildcache("push", "--key", "other.key", "oci-test", "mpich")
+    assert recording_cosign.signed
+
+
+def test_buildcache_push_signed_oci_without_key_fails(mutable_database, recording_cosign):
+    """Requesting a signed push to an OCI mirror without a cosign key must not silently
+    downgrade to an unsigned push."""
+    with oci_servers(InMemoryOCIRegistry("example.com")):
+        mirror("add", "oci-test", "oci://example.com/image")
+        with pytest.raises(spack.error.SpackError, match="requires a cosign key"):
+            buildcache("push", "--signed", "oci-test", "mpich")
+    assert not recording_cosign.signed
+
+
+def test_buildcache_push_unsigned_oci_does_not_sign(mutable_database, recording_cosign):
+    with oci_servers(InMemoryOCIRegistry("example.com")):
+        mirror("add", "oci-test", "oci://example.com/image")
+        buildcache("push", "oci-test", "mpich")
+    assert not recording_cosign.signed
+
+
+def test_buildcache_push_cosign_failure_fails_push(mutable_database, monkeypatch):
+    class Failing:
+        def __call__(self, *args, **kwargs):
+            raise spack.util.executable.ProcessError("signing failed")
+
+    monkeypatch.setattr(spack.util.cosign, "_COSIGN", Failing())
+    with oci_servers(InMemoryOCIRegistry("example.com")):
+        mirror("add", "oci-test", "oci://example.com/image")
+        with pytest.raises(spack.error.SpackError, match="signing failed"):
+            buildcache("push", "--key", "cosign.key", "oci-test", "mpich")

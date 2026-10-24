@@ -5,6 +5,7 @@
 import spack.binary_distribution
 import spack.config
 import spack.mirrors.mirror
+import spack.oci.image
 from spack.util import tty
 
 
@@ -28,7 +29,12 @@ def post_install(spec, explicit):
             )
             continue
 
-        signing_key = spack.binary_distribution.select_signing_key() if mirror.signed else None
+        signing_key = None
+        if mirror.signed:
+            if spack.oci.image.is_oci_url(mirror.push_url):
+                signing_key = mirror.cosign_key
+            else:
+                signing_key = spack.binary_distribution.select_signing_key()
         with spack.binary_distribution.make_uploader(
             mirror=mirror, force=True, signing_key=signing_key
         ) as uploader:

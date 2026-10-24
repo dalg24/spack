@@ -64,6 +64,7 @@ import spack.stage
 import spack.store
 import spack.user_environment
 import spack.util.archive
+import spack.util.cosign
 import spack.util.crypto
 import spack.util.environment
 import spack.util.filesystem as fsys
@@ -1230,8 +1231,10 @@ class OCIUploader(Uploader):
         force: bool,
         update_index: bool,
         base_image: Optional[str],
+        signing_key: Optional[str] = None,
     ) -> None:
         super().__init__(mirror, force, update_index)
+        self.signing_key = signing_key
         self.target_image = spack.oci.oci.image_from_mirror(mirror)
         self.base_image = ImageReference.from_string(base_image) if base_image else None
 
@@ -1245,6 +1248,7 @@ class OCIUploader(Uploader):
             force=self.force,
             tmpdir=self.tmpdir,
             executor=self.executor,
+            signing_key=self.signing_key,
         )
 
         self._base_images = base_images
@@ -1268,7 +1272,14 @@ class OCIUploader(Uploader):
                 base_image_cache=self._base_images,
             )
         _oci_put_manifest(
-            self._base_images, self._checksums, tagged_image, self.tmpdir, None, None, *roots
+            self._base_images,
+            self._checksums,
+            tagged_image,
+            self.tmpdir,
+            None,
+            None,
+            *roots,
+            signing_key=self.signing_key,
         )
 
         tty.info(f"Tagged {tagged_image}")
@@ -1310,8 +1321,13 @@ def make_uploader(
 ) -> Uploader:
     """Builder for the appropriate uploader based on the mirror type"""
     if spack.oci.image.is_oci_url(mirror.push_url):
+        # For OCI images the signing key is a cosign key
         return OCIUploader(
-            mirror=mirror, force=force, update_index=update_index, base_image=base_image
+            mirror=mirror,
+            force=force,
+            update_index=update_index,
+            base_image=base_image,
+            signing_key=signing_key,
         )
     else:
         return URLUploader(
@@ -1534,6 +1550,7 @@ def _oci_put_manifest(
     extra_config: Optional[dict],
     annotations: Optional[dict],
     *specs: spack.spec.Spec,
+    signing_key: Optional[str] = None,
 ):
     architecture = _oci_archspec_to_gooarch(specs[0])
 
@@ -1621,10 +1638,18 @@ def _oci_put_manifest(
         manifest["annotations"] = annotations
 
     # Finally upload the manifest
-    upload_manifest_with_retry(image_ref, manifest=manifest)
+    digest, _ = upload_manifest_with_retry(image_ref, manifest=manifest)
 
     # delete the config file
     os.unlink(config_file)
+
+    # Sign the digest we just uploaded, not the tag, which may move
+    if signing_key:
+        spack.util.cosign.sign_image(
+            f"{image_ref.domain}/{image_ref.name}@{digest}",
+            signing_key,
+            insecure_registry=image_ref.scheme == "http",
+        )
 
 
 def _oci_update_base_images(
@@ -1673,6 +1698,7 @@ def _oci_push(
     tmpdir: str,
     executor: concurrent.futures.Executor,
     force: bool = False,
+    signing_key: Optional[str] = None,
 ) -> Tuple[
     List[spack.spec.Spec],
     Dict[str, Tuple[dict, dict]],
@@ -1773,6 +1799,7 @@ def _oci_push(
             extra_config(spec),
             {"org.opencontainers.image.description": spec.format()},
             spec,
+            signing_key=signing_key,
         )
         for spec in manifests_to_upload
     ]

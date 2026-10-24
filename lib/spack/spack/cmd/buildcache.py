@@ -522,18 +522,18 @@ def push_fn(args):
     else:
         unsigned = not (args.key or args.signed)
 
-    # For OCI images, we require dependencies to be pushed for now.
-    if spack.oci.image.is_oci_url(mirror.push_url) and not unsigned:
-        tty.warn(
-            "Code signing is currently not supported for OCI images. "
-            "Use --unsigned to silence this warning."
-        )
-        unsigned = True
-
-    # Select a signing key, or None if unsigned.
-    signing_key = (
-        None if unsigned else (args.key or spack.binary_distribution.select_signing_key())
-    )
+    # Select a signing key, or None if unsigned. OCI images are signed with cosign, other
+    # build caches with GPG.
+    signing_key: Optional[str] = None
+    if not unsigned and spack.oci.image.is_oci_url(mirror.push_url):
+        signing_key = args.key or mirror.cosign_key
+        if not signing_key:
+            raise spack.error.SpackError(
+                "Signing OCI images requires a cosign key. Set `signed: {method: cosign, key: "
+                "...}` on the mirror, or pass --key."
+            )
+    elif not unsigned:
+        signing_key = args.key or spack.binary_distribution.select_signing_key()
 
     specs = _specs_to_be_packaged(
         roots,
