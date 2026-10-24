@@ -1985,9 +1985,28 @@ def download_tarball(
                         headers={"Accept": ", ".join(spack.oci.oci.manifest_content_type)},
                     )
                 ) as response:
-                    manifest = json.load(response)
+                    manifest_bytes = response.read()
+                manifest = json.loads(manifest_bytes)
             except Exception:
                 continue
+
+            # Verify the signature of the exact bytes we got. The config and layer digests used
+            # below come from this verified manifest, and are checksummed when fetched.
+            cosign_key = mirror.cosign_key
+            if cosign_key and not currently_unsigned:
+                manifest_digest = Digest.from_sha256(hashlib.sha256(manifest_bytes).hexdigest())
+                try:
+                    spack.util.cosign.verify_image(
+                        f"{ref.domain}/{ref.name}@{manifest_digest}",
+                        cosign_key,
+                        insecure_registry=ref.scheme == "http",
+                    )
+                except spack.util.cosign.CosignError as e:
+                    tty.error(
+                        f"Failed to verify signature for binary package "
+                        f"{spec.name}/{spec.dag_hash()[:7]} from {fetch_url}: {e}"
+                    )
+                    continue
 
             # Download the config = spec.json and the relevant tarball
             try:

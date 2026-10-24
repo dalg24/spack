@@ -394,12 +394,18 @@ def test_best_effort_upload(mutable_database: spack.database.Database, monkeypat
 
 
 class _RecordingCosign:
-    def __init__(self):
+    def __init__(self, reject_verify: bool = False):
         self.signed = []
+        self.verified = []
+        self.reject_verify = reject_verify
 
     def __call__(self, *args, **kwargs):
         if args[0] == "sign":
             self.signed.append(args[-1])
+        elif args[0] == "verify":
+            self.verified.append(args[-1])
+            if self.reject_verify:
+                raise spack.util.executable.ProcessError("no matching signatures")
 
 
 @pytest.fixture
@@ -474,3 +480,101 @@ def test_buildcache_push_cosign_failure_fails_push(mutable_database, monkeypatch
         mirror("add", "oci-test", "oci://example.com/image")
         with pytest.raises(spack.error.SpackError, match="signing failed"):
             buildcache("push", "--key", "cosign.key", "oci-test", "mpich")
+
+
+def _cosign_mirror(name: str = "oci-test"):
+    spack.config.CONFIG.set(
+        f"mirrors:{name}",
+        {"url": "oci://example.com/image", "signed": {"method": "cosign", "key": "cosign.pub"}},
+        scope="user",
+    )
+
+
+def _push_and_uninstall(mutable_database, spec_str: str = "mpich"):
+    buildcache("push", "--update-index", "oci-test", spec_str)
+    spec = mutable_database.query_local(spec_str)[0]
+    spec.package.do_uninstall(force=True)
+    return spec
+
+
+def test_buildcache_install_verifies_manifest_digest(mutable_database, recording_cosign):
+    """Install verifies the digest of the manifest it got from the registry, before using it."""
+    registry = InMemoryOCIRegistry("example.com")
+    with oci_servers(registry):
+        _cosign_mirror()
+        spec = _push_and_uninstall(mutable_database)
+        buildcache("install", "mpich")
+
+        assert mutable_database.installed(spec)
+        raw = registry.raw_manifests[("image", spack.binary_distribution._oci_default_tag(spec))]
+        digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+        assert f"example.com/image@{digest}" in recording_cosign.verified
+
+
+def test_buildcache_install_rejects_bad_signature(mutable_database, monkeypatch):
+    """A binary whose signature does not verify is not installed."""
+    registry = InMemoryOCIRegistry("example.com")
+    signer = _RecordingCosign()
+    monkeypatch.setattr(spack.util.cosign, "_COSIGN", signer)
+    with oci_servers(registry):
+        _cosign_mirror()
+        spec = _push_and_uninstall(mutable_database)
+
+        signer.reject_verify = True
+        with pytest.raises(RuntimeError, match="download of binary cache file"):
+            buildcache("install", "mpich")
+
+        assert signer.verified
+        assert not mutable_database.installed(spec)
+
+
+def test_buildcache_install_unsigned_skips_verification(mutable_database, recording_cosign):
+    with oci_servers(InMemoryOCIRegistry("example.com")):
+        _cosign_mirror()
+        spec = _push_and_uninstall(mutable_database)
+        buildcache("install", "--unsigned", "mpich")
+
+        assert mutable_database.installed(spec)
+        assert not recording_cosign.verified
+
+
+def test_buildcache_install_oci_without_cosign_config_does_not_verify(
+    mutable_database, recording_cosign
+):
+    """OCI mirrors that don't configure cosign keep working as before."""
+    with oci_servers(InMemoryOCIRegistry("example.com")):
+        mirror("add", "oci-test", "oci://example.com/image")
+        spec = _push_and_uninstall(mutable_database)
+        buildcache("install", "mpich")
+
+        assert mutable_database.installed(spec)
+        assert not recording_cosign.verified
+
+
+class _DigestBoundCosign(_RecordingCosign):
+    """Accepts a signature only for the exact digest that was signed, like real cosign."""
+
+    def __call__(self, *args, **kwargs):
+        super().__call__(*args, **kwargs)
+        if args[0] == "verify" and args[-1] not in self.signed:
+            raise spack.util.executable.ProcessError("no matching signatures")
+
+
+def test_buildcache_install_rejects_manifest_changed_after_signing(mutable_database, monkeypatch):
+    """If the manifest served for a tag is not the one that was signed, it is not installed."""
+    registry = InMemoryOCIRegistry("example.com")
+    monkeypatch.setattr(spack.util.cosign, "_COSIGN", _DigestBoundCosign())
+    with oci_servers(registry):
+        _cosign_mirror()
+        spec = _push_and_uninstall(mutable_database)
+
+        # Someone with write access to the registry re-points the tag to a different manifest
+        key = ("image", spack.binary_distribution._oci_default_tag(spec))
+        tampered = dict(registry.manifests[key])
+        tampered["annotations"] = {"tampered": "yes"}
+        registry.manifests[key] = tampered
+        registry.raw_manifests[key] = json.dumps(tampered, separators=(",", ":")).encode()
+
+        with pytest.raises(RuntimeError, match="download of binary cache file"):
+            buildcache("install", "mpich")
+        assert not mutable_database.installed(spec)

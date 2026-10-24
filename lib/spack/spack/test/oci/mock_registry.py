@@ -134,6 +134,7 @@ class InMemoryOCIRegistry(DummyServer):
 
         # Map from (name, tag) to manifest
         self.manifests: Dict[Tuple[str, str], dict] = {}
+        self.raw_manifests: Dict[Tuple[str, str], bytes] = {}
 
     def index(self, req: Request):
         return MockHTTPResponse.with_json(200, "OK", body={})
@@ -189,7 +190,8 @@ class InMemoryOCIRegistry(DummyServer):
         content_type = req.get_header("Content-type")
         assert content_type in spack.oci.oci.all_content_type
 
-        index_or_manifest = json.loads(self._require_data(req))
+        raw = self._require_data(req)
+        index_or_manifest = json.loads(raw)
 
         # Verify that we have all blobs (layers for manifest, manifests for index)
         if content_type in spack.oci.oci.manifest_content_type:
@@ -203,6 +205,9 @@ class InMemoryOCIRegistry(DummyServer):
                 )
 
         self.manifests[(name, ref)] = index_or_manifest
+        # Like a real registry, serve back exactly the bytes that were pushed, since the
+        # manifest digest (and thus any signature) depends on them.
+        self.raw_manifests[(name, ref)] = raw
 
         return MockHTTPResponse(
             201, "Created", headers={"Location": f"/v2/{name}/manifests/{ref}"}
@@ -213,12 +218,21 @@ class InMemoryOCIRegistry(DummyServer):
             return MockHTTPResponse(404, "Not found")
 
         manifest_or_index = self.manifests[(name, ref)]
+        raw = self.raw_manifests.get((name, ref))
+        if raw is None:
+            # Entries added to `manifests` directly by a test
+            return MockHTTPResponse.with_json(
+                200,
+                "OK",
+                headers={"Content-type": manifest_or_index["mediaType"]},
+                body=manifest_or_index,
+            )
 
-        return MockHTTPResponse.with_json(
+        return MockHTTPResponse(
             200,
             "OK",
             headers={"Content-type": manifest_or_index["mediaType"]},
-            body=manifest_or_index,
+            body=io.BytesIO(raw),
         )
 
     def _require_data(self, req: Request) -> bytes:
