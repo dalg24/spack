@@ -507,6 +507,18 @@ def ensure_gpg_in_path_or_raise() -> spack.util.executable.Executable:
     )
 
 
+def cosign_root_spec() -> str:
+    """Return the root spec used to bootstrap cosign"""
+    return _root_spec("cosign@2:")
+
+
+def ensure_cosign_in_path_or_raise() -> spack.util.executable.Executable:
+    """Ensure cosign is in the PATH or raise."""
+    return ensure_executables_in_path_or_raise(
+        executables=["cosign"], abstract_spec=cosign_root_spec()
+    )
+
+
 def patchelf_root_spec() -> str:
     """Return the root spec used to bootstrap patchelf"""
     # 0.13.1 is the last version not to require C++17.
