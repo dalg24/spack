@@ -108,9 +108,29 @@ mirror_entry = {
             "precompiled packages",
         },
         "signed": {
-            "type": "boolean",
-            "description": "Whether to require GPG signature verification for packages from "
-            "this mirror",
+            "description": "Whether to require signature verification for packages from this "
+            "mirror. A boolean selects GPG signatures (build caches that are not OCI images). "
+            "An object selects another signing method.",
+            "anyOf": [
+                {"type": "boolean"},
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["method", "key"],
+                    "properties": {
+                        "method": {
+                            "type": "string",
+                            "enum": ["cosign"],
+                            "description": "Sign and verify OCI images with cosign",
+                        },
+                        "key": {
+                            "type": "string",
+                            "description": "Cosign key: path to a private key (used when "
+                            "pushing) or public key (used when installing), or a KMS URI",
+                        },
+                    },
+                },
+            ],
         },
         "fetch": {
             **fetch_and_push,

@@ -143,13 +143,26 @@ class Mirror:
         return isinstance(self._data, str) or self._data.get("source", True)
 
     @property
-    def signed(self) -> bool:
-        # TODO: OCI support signing
-        # Only checking for fetch, push is handled by OCI implementation
-        if is_oci_url(self.fetch_url):
-            return False
+    def cosign_key(self) -> Optional[str]:
+        """Key used to sign and verify with cosign, or None if cosign is not configured."""
+        if isinstance(self._data, str):
+            return None
+        signed = self._data.get("signed")
+        if isinstance(signed, dict) and signed.get("method") == "cosign":
+            return signed["key"]
+        return None
 
-        return isinstance(self._data, str) or self._data.get("signed", True)
+    @property
+    def signed(self) -> bool:
+        if is_oci_url(self.fetch_url):
+            # OCI images are signed with cosign, and only if that is configured
+            return self.cosign_key is not None
+
+        if isinstance(self._data, str):
+            return True
+
+        # A dict value selects a method other than GPG, see ensure_mirror_usable()
+        return bool(self._data.get("signed", True))
 
     @property
     def autopush(self) -> bool:
@@ -194,6 +207,13 @@ class Mirror:
         access_token_variable = self._get_value("access_token_variable", direction)
 
         errors = []
+
+        if (
+            not isinstance(self._data, str)
+            and isinstance(self._data.get("signed"), dict)
+            and not is_oci_url(self.get_url(direction))
+        ):
+            errors.append("cosign signing is only supported for OCI build caches")
 
         # Verify that the credentials that are variables expand
         if access_pair:
