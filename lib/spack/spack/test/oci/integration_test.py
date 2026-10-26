@@ -400,6 +400,8 @@ class _RecordingCosign:
         self.reject_verify = reject_verify
 
     def __call__(self, *args, **kwargs):
+        if args[0] == "version":
+            return "GitVersion:    v3.1.4\n"
         if args[0] == "sign":
             self.signed.append(args[-1])
         elif args[0] == "verify":
@@ -412,6 +414,7 @@ class _RecordingCosign:
 def recording_cosign(monkeypatch):
     fake = _RecordingCosign()
     monkeypatch.setattr(spack.util.cosign, "_COSIGN", fake)
+    monkeypatch.setattr(spack.util.cosign, "_COSIGN_MAJOR", None)
     return fake
 
 
@@ -473,9 +476,12 @@ def test_buildcache_push_unsigned_oci_does_not_sign(mutable_database, recording_
 def test_buildcache_push_cosign_failure_fails_push(mutable_database, monkeypatch):
     class Failing:
         def __call__(self, *args, **kwargs):
+            if args[0] == "version":
+                return "GitVersion:    v3.1.4\n"
             raise spack.util.executable.ProcessError("signing failed")
 
     monkeypatch.setattr(spack.util.cosign, "_COSIGN", Failing())
+    monkeypatch.setattr(spack.util.cosign, "_COSIGN_MAJOR", None)
     with oci_servers(InMemoryOCIRegistry("example.com")):
         mirror("add", "oci-test", "oci://example.com/image")
         with pytest.raises(spack.error.SpackError, match="signing failed"):
@@ -516,6 +522,7 @@ def test_buildcache_install_rejects_bad_signature(mutable_database, monkeypatch)
     registry = InMemoryOCIRegistry("example.com")
     signer = _RecordingCosign()
     monkeypatch.setattr(spack.util.cosign, "_COSIGN", signer)
+    monkeypatch.setattr(spack.util.cosign, "_COSIGN_MAJOR", None)
     with oci_servers(registry):
         _cosign_mirror()
         spec = _push_and_uninstall(mutable_database)
@@ -555,15 +562,17 @@ class _DigestBoundCosign(_RecordingCosign):
     """Accepts a signature only for the exact digest that was signed, like real cosign."""
 
     def __call__(self, *args, **kwargs):
-        super().__call__(*args, **kwargs)
+        result = super().__call__(*args, **kwargs)
         if args[0] == "verify" and args[-1] not in self.signed:
             raise spack.util.executable.ProcessError("no matching signatures")
+        return result
 
 
 def test_buildcache_install_rejects_manifest_changed_after_signing(mutable_database, monkeypatch):
     """If the manifest served for a tag is not the one that was signed, it is not installed."""
     registry = InMemoryOCIRegistry("example.com")
     monkeypatch.setattr(spack.util.cosign, "_COSIGN", _DigestBoundCosign())
+    monkeypatch.setattr(spack.util.cosign, "_COSIGN_MAJOR", None)
     with oci_servers(registry):
         _cosign_mirror()
         spec = _push_and_uninstall(mutable_database)
