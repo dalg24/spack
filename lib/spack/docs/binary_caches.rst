@@ -284,10 +284,13 @@ Secret keys may also be later exported using the ``spack gpg export <location> [
 
    `This Digital Ocean tutorial <https://www.digitalocean.com/community/tutorials/how-to-setup-additional-entropy-for-cloud-servers-using-haveged>`_ provides a good overview of sources of randomness.
 
+.. _build-cache-signing:
+
 Build Cache Signing
 -------------------
 
 By default, Spack will add a cryptographic signature to each package pushed to a build cache and verify the signature when installing from a build cache.
+This uses GPG, and applies to all build caches except OCI registries, which are signed with cosign instead (see :ref:`oci-signing`).
 
 Keys for signing can be managed with the :ref:`spack gpg <cmd-spack-gpg>` command, as well as ``spack buildcache keys``, as mentioned above.
 
@@ -448,6 +451,68 @@ From here, you can use the mirror as any other build cache:
 
    Spack defaults to ``https`` for OCI registries, and does not fall back to ``http`` in case of failure.
    For local registries which use ``http`` instead of ``https``, you can specify ``oci+http://localhost:5000/my_image``.
+
+.. _oci-signing:
+
+Signing OCI Images with Cosign
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. versionadded:: 1.3
+
+GPG signatures, described in :ref:`Build Cache Signing <build-cache-signing>`, are not available for OCI registries.
+Instead, Spack can sign the images it pushes with `cosign <https://docs.sigstore.dev/cosign/overview/>`_, and verify them before installing.
+Cosign 2 and 3 are supported. Spack uses the ``cosign`` executable found in ``PATH``, and otherwise tries to bootstrap it.
+
+To enable it, give the mirror a cosign key:
+
+.. code-block:: console
+
+    $ spack mirror add --cosign-key /path/to/cosign.key my_registry oci://example.com/my_image
+    $ spack mirror set --cosign-key /path/to/cosign.key my_registry  # for an existing mirror
+
+or edit ``mirrors.yaml`` directly:
+
+.. code-block:: yaml
+
+    mirrors:
+      my_registry:
+        url: oci://example.com/my_image
+        signed:
+          method: cosign
+          key: /path/to/cosign.key
+
+The key is a cosign key file, or any key reference that ``cosign sign --key`` and ``cosign verify --key`` accept, such as a KMS URI.
+Pushing needs the private key, and installing needs the matching public key, so the setting differs between the machine that builds and the machines that install:
+
+.. code-block:: console
+
+    $ spack mirror set --cosign-key cosign.pub my_registry  # on machines that only install
+
+A key pair can be created with ``cosign generate-key-pair``.
+If the private key is encrypted, set ``COSIGN_PASSWORD`` in the environment; Spack does not prompt for it.
+You can also pass a key to a single push with ``spack buildcache push --key <key> <mirror> <specs...>``.
+
+When pushing, Spack signs the digest of the manifest of each image it uploads, and the push fails if signing fails.
+The signature is stored in the same repository, as an additional tag of the form ``sha256-<digest>.sig``, which is how cosign signs images.
+When installing, Spack verifies the signature of the manifest it received from the registry before using it, and never installs a binary whose signature is missing or invalid.
+Spack does not fall back to unsigned binaries from another mirror for a mirror configured with a cosign key, although it may install the binary from another mirror that provides it.
+Verification can be skipped for a single command with ``spack buildcache install --unsigned``.
+
+Signing and verification only use the key, and do not contact any Sigstore service or transparency log, so they work on machines without access to the internet.
+Keyless signing, with certificates from Fulcio, is not supported.
+
+.. note::
+
+   The following are not covered by cosign signatures:
+
+   * The index of a registry (the ``index.spack`` tag) is not signed.
+     It is only used to find out which specs exist, and what Spack installs is always verified.
+   * ``spack buildcache sync`` and ``spack buildcache copy`` do not copy signatures.
+     Sign the copy again, or push it with ``spack buildcache push``.
+   * Public keys are not distributed through the registry, as GPG keys are with ``spack buildcache keys``.
+     Share the public key some other way.
+
+   An OCI mirror without a cosign key is not signed or verified, as before.
 
 .. _oci-authentication:
 

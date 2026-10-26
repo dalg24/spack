@@ -12,6 +12,7 @@ import spack.binary_distribution
 import spack.cmd.mirror
 import spack.concretize
 import spack.environment as ev
+import spack.error
 import spack.mirrors.utils
 import spack.package_base
 import spack.spec
@@ -818,3 +819,32 @@ def test_mirror_skip_placeholder_pkg(tmp_path: pathlib.Path):
     )
     assert result is False
     assert not mirror_stats.errors
+
+
+def test_mirror_add_set_cosign_key(mutable_config: Configuration):
+    mirror("add", "--cosign-key", "cosign.pub", "example", "oci://example.com/image")
+    assert mutable_config.get("mirrors:example") == {
+        "url": "oci://example.com/image",
+        "signed": {"method": "cosign", "key": "cosign.pub"},
+    }
+
+    # The key can be replaced, and cosign can be turned off again
+    mirror("set", "--cosign-key", "other.pub", "example")
+    assert mutable_config.get("mirrors:example:signed") == {"method": "cosign", "key": "other.pub"}
+    mirror("set", "--unsigned", "example")
+    assert mutable_config.get("mirrors:example:signed") is False
+
+
+@pytest.mark.parametrize("command", [("add", "example", "https://example.com/cache"), ("set",)])
+def test_mirror_cosign_key_requires_oci(mutable_config: Configuration, command):
+    if command[0] == "set":
+        mirror("add", "example", "https://example.com/cache")
+        command = ("set", "example")
+    with pytest.raises(spack.error.SpackError, match="only supported for OCI"):
+        mirror(command[0], "--cosign-key", "cosign.pub", *command[1:])
+    assert "signed" not in (mutable_config.get("mirrors:example") or {})
+
+
+def test_mirror_cosign_key_excludes_signed(mutable_config: Configuration):
+    with pytest.raises(SpackCommandError, match="exit code 2"):
+        mirror("add", "--signed", "--cosign-key", "k", "example", "oci://example.com/image")

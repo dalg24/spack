@@ -7,6 +7,7 @@ import hashlib
 import os
 import sys
 from concurrent.futures import as_completed
+from typing import Optional
 
 import spack.caches
 import spack.cmd
@@ -15,6 +16,7 @@ import spack.config
 import spack.fetch_strategy
 import spack.mirrors.mirror
 import spack.mirrors.utils
+import spack.oci.image
 import spack.repo
 import spack.spec
 import spack.stage
@@ -155,6 +157,15 @@ def setup_parser(subparser: argparse.ArgumentParser) -> None:
         default=None,
         dest="signed",
     )
+    add_parser_signed.add_argument(
+        "--cosign-key",
+        metavar="KEY",
+        help="sign OCI images with cosign when pushing, and verify them when installing from "
+        "this build cache. KEY is a cosign key file or KMS URI: a private key is needed to push, "
+        "and the matching public key to install",
+        default=None,
+        dest="cosign_key",
+    )
     add_parser_view = add_parser.add_mutually_exclusive_group(required=False)
     add_parser_view.add_argument(
         "--view",
@@ -250,6 +261,15 @@ def setup_parser(subparser: argparse.ArgumentParser) -> None:
         default=None,
         dest="signed",
     )
+    set_parser_unsigned.add_argument(
+        "--cosign-key",
+        metavar="KEY",
+        help="sign OCI images with cosign when pushing, and verify them when installing from "
+        "this build cache. KEY is a cosign key file or KMS URI: a private key is needed to push, "
+        "and the matching public key to install",
+        default=None,
+        dest="cosign_key",
+    )
     set_parser.add_argument(
         "--scope",
         action=arguments.ConfigScope,
@@ -324,8 +344,19 @@ def _configure_access_pair(args, id_tok, id_variable_tok, secret_variable_tok, d
         return None
 
 
+def _signed_setting(args, url: Optional[str]):
+    """Return the value of the ``signed`` setting selected on the command line, or None if
+    none was selected."""
+    if getattr(args, "cosign_key", None):
+        if not url or not spack.oci.image.is_oci_url(url):
+            raise SpackError("--cosign-key is only supported for OCI build caches")
+        return {"method": "cosign", "key": args.cosign_key}
+    return getattr(args, "signed", None)
+
+
 def mirror_add(args):
     """add a mirror to Spack"""
+    signed = _signed_setting(args, args.url)
     if (
         args.s3_access_key_id
         or args.s3_access_key_id_variable
@@ -339,7 +370,7 @@ def mirror_add(args):
         or args.oci_username_variable
         or args.oci_password_variable
         or args.autopush
-        or args.signed is not None
+        or signed is not None
     ):
         connection = {"url": args.url}
         # S3 Connection
@@ -370,8 +401,8 @@ def mirror_add(args):
             connection["source"] = "source" in args.type
         if args.autopush:
             connection["autopush"] = args.autopush
-        if args.signed is not None:
-            connection["signed"] = args.signed
+        if signed is not None:
+            connection["signed"] = signed
         if args.view_name:
             connection["view"] = args.view_name
 
@@ -466,8 +497,9 @@ def _configure_mirror(args):
     )
     if access_pair:
         changes["access_pair"] = access_pair
-    if getattr(args, "signed", None) is not None:
-        changes["signed"] = args.signed
+    signed = _signed_setting(args, changes.get("url") or entry.get_url(direction or "fetch"))
+    if signed is not None:
+        changes["signed"] = signed
     if getattr(args, "autopush", None) is not None:
         changes["autopush"] = args.autopush
     if getattr(args, "view_name", None):

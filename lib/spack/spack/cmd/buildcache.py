@@ -86,7 +86,12 @@ def setup_parser(subparser: argparse.ArgumentParser):
         help="push signed buildcache tarballs",
     )
     push_sign.add_argument(
-        "--key", "-k", metavar="key", type=str, default=None, help="key for signing"
+        "--key",
+        "-k",
+        metavar="key",
+        type=str,
+        default=None,
+        help="key for signing: a GPG key, or a cosign key when pushing to an OCI registry",
     )
     push.add_argument(
         "mirror", type=arguments.mirror_name_or_url, help="mirror name, path, or URL"
