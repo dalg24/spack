@@ -509,7 +509,7 @@ def ensure_gpg_in_path_or_raise() -> spack.util.executable.Executable:
 
 def cosign_root_spec() -> str:
     """Return the root spec used to bootstrap cosign"""
-    return _root_spec("cosign@2:")
+    return _root_spec("cosign@3:")
 
 
 def ensure_cosign_in_path_or_raise() -> spack.util.executable.Executable:

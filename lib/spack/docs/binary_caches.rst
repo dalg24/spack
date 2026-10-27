@@ -461,7 +461,7 @@ Signing OCI Images with Cosign
 
 GPG signatures, described in :ref:`Build Cache Signing <build-cache-signing>`, are not available for OCI registries.
 Instead, Spack can sign the images it pushes with `cosign <https://docs.sigstore.dev/cosign/overview/>`_, and verify them before installing.
-Cosign 2 and 3 are supported. Spack uses the ``cosign`` executable found in ``PATH``, and otherwise tries to bootstrap it.
+Cosign 3 or newer is required. Spack uses the ``cosign`` executable found in ``PATH``, and otherwise tries to bootstrap it.
 
 To enable it, give the mirror a cosign key:
 

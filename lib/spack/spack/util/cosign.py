@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 """Thin wrapper around the ``cosign`` executable, used to sign and verify OCI images with a
 key. Neither signing nor verification contacts any Sigstore service, so this works on machines
-without access to the public internet. Cosign 2 and 3 are supported."""
+without access to the public internet. Cosign 3 or newer is required."""
 
 import getpass
 import json
@@ -26,9 +26,12 @@ _PASSWORD: Optional[str] = None
 #: Major version of the cosign executable, determined on first use
 _COSIGN_MAJOR: Optional[int] = None
 
-#: A signing config without any Fulcio, Rekor or timestamp authority service. Cosign 3 would
+#: The oldest major version of cosign that is supported
+MIN_COSIGN_MAJOR = 3
+
+#: A signing config without any Fulcio, Rekor or timestamp authority service. Cosign would
 #: otherwise contact a public timestamp authority and transparency log when signing, also when
-#: signing with a key. Cosign 2 has no signing configs, and uses ``--tlog-upload=false``.
+#: signing with a key.
 _OFFLINE_SIGNING_CONFIG = {
     "mediaType": "application/vnd.dev.sigstore.signingconfig.v0.2+json",
     "rekorTlogConfig": {},
@@ -50,7 +53,8 @@ def _cosign() -> Executable:
     return _COSIGN
 
 
-def _major_version() -> int:
+def _check_version() -> None:
+    """Raise unless the cosign executable is recent enough."""
     global _COSIGN_MAJOR
     if _COSIGN_MAJOR is None:
         try:
@@ -61,7 +65,10 @@ def _major_version() -> int:
         if not match:
             raise CosignError("could not determine the version of cosign")
         _COSIGN_MAJOR = int(match.group(1))
-    return _COSIGN_MAJOR
+    if _COSIGN_MAJOR < MIN_COSIGN_MAJOR:
+        raise CosignError(
+            f"cosign {_COSIGN_MAJOR} is not supported, use cosign {MIN_COSIGN_MAJOR} or newer"
+        )
 
 
 def _needs_password(key: str) -> bool:
@@ -115,24 +122,20 @@ def sign_image(ref: str, key: str, insecure_registry: bool = False) -> None:
     if _needs_password(key):
         # Never let cosign prompt: this may run in a thread, and the prompt would be invisible
         raise CosignError(_NO_PASSWORD_MESSAGE.format(key=key))
-    major = _major_version()
-    if major < 2:
-        raise CosignError(f"cosign {major} is not supported, use cosign 2 or newer")
+    _check_version()
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        offline_args = ["--tlog-upload=false"]
-        if major >= 3:
-            config = os.path.join(tmpdir, "signing-config.json")
-            with open(config, "w", encoding="utf-8") as f:
-                json.dump(_OFFLINE_SIGNING_CONFIG, f)
-            offline_args = ["--signing-config", config]
+        config = os.path.join(tmpdir, "signing-config.json")
+        with open(config, "w", encoding="utf-8") as f:
+            json.dump(_OFFLINE_SIGNING_CONFIG, f)
         try:
             _cosign()(
                 "sign",
                 "--key",
                 key,
                 "--yes",
-                *offline_args,
+                "--signing-config",
+                config,
                 *_registry_args(insecure_registry),
                 ref,
                 output=str,
@@ -154,6 +157,7 @@ def verify_image(ref: str, key: str, insecure_registry: bool = False) -> None:
         CosignError: if there is no signature, or it does not verify against ``key``
     """
     _require_digest(ref)
+    _check_version()
     try:
         _cosign()(
             "verify",

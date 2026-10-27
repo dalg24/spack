@@ -47,22 +47,17 @@ def fake_cosign(monkeypatch):
     return _install(monkeypatch, FakeCosign())
 
 
-@pytest.fixture(params=[2, 3])
-def any_cosign(request, monkeypatch):
-    return _install(monkeypatch, FakeCosign(major=request.param))
-
-
-def test_sign_image(any_cosign):
+def test_sign_image(fake_cosign):
     cosign.sign_image(f"example.com/img@{DIGEST}", "cosign.key")
-    (args,) = any_cosign.calls
+    (args,) = fake_cosign.calls
     assert args[:4] == ("sign", "--key", "cosign.key", "--yes")
     assert args[-1] == f"example.com/img@{DIGEST}"
     assert "--allow-http-registry" not in args
 
 
-def test_sign_image_is_offline_cosign3(fake_cosign):
-    """Cosign 3 contacts a public transparency log and timestamp authority even when signing
-    with a key, unless given a signing config that has neither."""
+def test_sign_image_is_offline(fake_cosign):
+    """Cosign contacts a public transparency log and timestamp authority even when signing with
+    a key, unless given a signing config that has neither."""
     seen = {}
 
     def record(*args, **kwargs):
@@ -77,19 +72,20 @@ def test_sign_image_is_offline_cosign3(fake_cosign):
     assert "--tlog-upload=false" not in fake_cosign.calls[0]
 
 
-def test_sign_image_is_offline_cosign2(monkeypatch):
-    """Cosign 2 has no signing configs, and the flag below is what disables the upload."""
-    fake = _install(monkeypatch, FakeCosign(major=2))
-    cosign.sign_image(f"example.com/img@{DIGEST}", "cosign.key")
-    assert "--tlog-upload=false" in fake.calls[0]
-    assert "--signing-config" not in fake.calls[0]
-
-
-def test_old_cosign_is_refused(monkeypatch):
-    fake = _install(monkeypatch, FakeCosign(major=1))
-    with pytest.raises(cosign.CosignError, match="cosign 1 is not supported"):
-        cosign.sign_image(f"example.com/img@{DIGEST}", "cosign.key")
+@pytest.mark.parametrize("major", [1, 2])
+@pytest.mark.parametrize("fn", [cosign.sign_image, cosign.verify_image])
+def test_old_cosign_is_refused(monkeypatch, major, fn):
+    """Neither signing nor verifying is done with a cosign that is older than supported."""
+    fake = _install(monkeypatch, FakeCosign(major=major))
+    with pytest.raises(cosign.CosignError, match=f"cosign {major} is not supported, use cosign 3"):
+        fn(f"example.com/img@{DIGEST}", "key")
     assert not fake.calls
+
+
+def test_newer_cosign_is_accepted(monkeypatch):
+    fake = _install(monkeypatch, FakeCosign(major=4))
+    cosign.verify_image(f"example.com/img@{DIGEST}", "key")
+    assert len(fake.calls) == 1
 
 
 def test_unparseable_version(monkeypatch):
