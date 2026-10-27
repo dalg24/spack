@@ -274,8 +274,9 @@ def sign_image_keyless(ref: str, insecure_registry: bool = False) -> None:
         )
     except spack.util.executable.ProcessError as e:
         raise CosignError(
-            f"cosign failed to sign {ref} without a key. This needs to run in a CI job that is "
-            f"allowed to request an identity token: {e}"
+            f"cosign failed to sign {ref} without a key: {e}\n"
+            "Keyless signing needs a CI job that can request an identity token, and access to "
+            "the Sigstore services."
         ) from e
 
 

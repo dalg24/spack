@@ -315,7 +315,7 @@ def test_sign_keyless_tag_is_refused(fake_cosign):
 
 def test_sign_keyless_failure_says_what_is_needed(monkeypatch):
     _install(monkeypatch, FakeCosign(fail=True))
-    with pytest.raises(cosign.CosignError, match="identity token"):
+    with pytest.raises(cosign.CosignError, match="boom"):  # cosign's own reason is kept
         cosign.sign_image_keyless(f"example.com/img@{DIGEST}")
 
 
@@ -344,7 +344,7 @@ def test_keyless_signer_fails_when_signed_as_another_identity(monkeypatch):
 
 def test_keyless_signer_does_not_verify_when_signing_failed(monkeypatch):
     fake = _install(monkeypatch, FakeCosign(fail=True))
-    with pytest.raises(cosign.CosignError, match="identity token"):
+    with pytest.raises(cosign.CosignError, match="boom"):
         cosign.KeylessSigner(issuer=ISSUER, identity=IDENTITY).sign(f"example.com/img@{DIGEST}")
     assert [call[0] for call in fake.calls] == ["sign"]
 

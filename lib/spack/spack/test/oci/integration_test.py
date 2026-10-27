@@ -732,5 +732,5 @@ def test_buildcache_push_keyless_without_identity_token_fails(mutable_database, 
     monkeypatch.setattr(spack.util.cosign, "_COSIGN_MAJOR", None)
     with oci_servers(InMemoryOCIRegistry("example.com")):
         _keyless_mirror(identity=_IDENTITY, issuer=_ISSUER)
-        with pytest.raises(spack.error.SpackError, match="allowed to request an identity token"):
+        with pytest.raises(spack.error.SpackError, match="retrieving ID token: empty input"):
             buildcache("push", "oci-test", "mpich")

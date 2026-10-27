@@ -65,7 +65,16 @@ jobs:
           spack config get mirrors
           spack install --fail-fast zlib-ng
           # Signs with the identity token of this job, and checks the signature against IDENTITY
-          spack buildcache push --update-index test-cache zlib-ng
+          set -o pipefail
+          if ! spack buildcache push --update-index test-cache zlib-ng 2>&1 | tee push.log; then
+            echo "::group::Why signing failed"
+            # Cosign prints a long notice before the reason, so show only the reasons
+            grep -E "^(Error|error during command execution)|Fulcio|Rekor|OIDC|ID token|identity" push.log \
+              | sort -u || true
+            echo "::endgroup::"
+            echo "::error::pushing failed, see 'Why signing failed' above"
+            exit 1
+          fi
 
       - name: The images are signed by this workflow, according to cosign itself
         run: |
