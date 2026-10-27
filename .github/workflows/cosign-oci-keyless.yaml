@@ -63,16 +63,21 @@ jobs:
           spack python .github/workflows/bin/cosign_mirror_config.py "$OCI_URL" "$ISSUER" \
               --identity "$IDENTITY"
           spack config get mirrors
-          spack install --fail-fast zlib-ng
+          # Build from source, and not from the mirror: otherwise what is in the registry from an
+          # earlier run decides what is installed here, and the push then misses some of it
+          spack install --no-cache --fail-fast zlib-ng
           # Signs with the identity token of this job, and checks the signature against IDENTITY
           set -o pipefail
           if ! spack buildcache push --update-index test-cache zlib-ng 2>&1 | tee push.log; then
             echo "::group::Why signing failed"
-            # Cosign prints a long notice before the reason, so show the lines after it
-            grep -n "By typing 'y', you attest" push.log | head -1 || true
-            awk '/By typing .y., you attest/ {found=1; next} found' push.log | sort -u || true
+            if grep -q "By typing 'y', you attest" push.log; then
+              # Cosign prints a long notice before the reason, so show the lines after it
+              awk '/By typing .y., you attest/ {found=1; next} found' push.log | sort -u || true
+            else
+              echo "Cosign did not run or printed no notice: the push failed before or apart from signing."
+            fi
             echo "::endgroup::"
-            echo "::error::pushing failed, see 'Why signing failed' above"
+            echo "::error::pushing failed, see the output above"
             exit 1
           fi
 
