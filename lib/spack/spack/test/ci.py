@@ -9,11 +9,13 @@ from urllib.error import HTTPError
 
 import pytest
 
+import spack.binary_distribution
 import spack.concretize
 import spack.environment as ev
 import spack.error
 import spack.paths
 import spack.reporters.cdash
+import spack.spec
 import spack.util.filesystem as fs
 import spack.util.git
 from spack import ci, repo
@@ -730,3 +732,58 @@ def test_ci_stack_changed_relative_ci_config_path(git, mock_git_package_changes,
         )
 
     assert ci.stack_changed(stack_env)
+
+
+class _RecordingUploader:
+    def __init__(self, record):
+        self.record = record
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def push_or_raise(self, specs, config):
+        pass
+
+
+@pytest.fixture
+def recorded_uploaders(monkeypatch):
+    """Record the signing key spack ci hands to the uploader, without pushing anything."""
+    keys = []
+
+    def make_uploader(mirror, *args, signing_key=None, **kwargs):
+        keys.append(signing_key)
+        return _RecordingUploader(keys)
+
+    monkeypatch.setattr(spack.binary_distribution, "make_uploader", make_uploader)
+    monkeypatch.setattr(spack.binary_distribution, "select_signing_key", lambda: "GPGKEY")
+    return keys
+
+
+@pytest.mark.parametrize("sign_binaries", [True, False])
+def test_push_to_oci_build_cache_never_uses_gpg_key(
+    mutable_config, recorded_uploaders, sign_binaries
+):
+    """OCI images are signed with cosign. A GPG key must not be mistaken for a cosign key."""
+    ci.push_to_build_cache(spack.spec.Spec(), "oci://example.com/image", sign_binaries)
+    assert recorded_uploaders == [None]
+
+
+def test_push_to_oci_build_cache_uses_configured_cosign_key(mutable_config, recorded_uploaders):
+    mutable_config.set(
+        "mirrors:ci",
+        {"url": "oci://example.com/image", "signed": {"method": "cosign", "key": "ci.key"}},
+        scope="user",
+    )
+    ci.push_to_build_cache(spack.spec.Spec(), "oci://example.com/image", False)
+    assert recorded_uploaders == ["ci.key"]
+
+
+@pytest.mark.parametrize("sign_binaries,expected", [(True, "GPGKEY"), (False, None)])
+def test_push_to_other_build_cache_keeps_using_gpg(
+    mutable_config, recorded_uploaders, sign_binaries, expected
+):
+    ci.push_to_build_cache(spack.spec.Spec(), "https://example.com/cache", sign_binaries)
+    assert recorded_uploaders == [expected]
