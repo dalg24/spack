@@ -547,8 +547,10 @@ The expression has to match the whole identity, and one that matches everyone is
 The identity is a security setting: keep it as narrow as possible, since anyone who can sign as a matching identity can publish binaries you will install.
 
 Such certificates are only valid for minutes, so cosign checks that the signature was made in that time against a record in the Sigstore transparency log.
-Verifying therefore needs access to the network, and cannot be done offline as it can with a key.
-For a private Sigstore deployment, set ``trusted_root`` to the path of its trusted root file.
+The proof of that is stored with the signature, so verifying does not contact the transparency log.
+Cosign does, however, refresh the Sigstore trusted root from the network every time, so verifying needs access to ``tuf-repo-cdn.sigstore.dev``.
+To verify on machines without network access, or to use a private Sigstore deployment, set ``trusted_root`` to the path of a Sigstore trusted root file; cosign then does not use the network at all.
+The root of the public Sigstore instance can be saved with ``cosign trusted-root create --with-default-services --out trusted_root.json``, and has to be updated when Sigstore rotates its keys.
 
 Pushing to a mirror that is configured this way signs the images with the identity of the CI job, and then checks the signature against the identity of the mirror.
 If the job runs as someone else, the push fails, instead of publishing images that clients would refuse.
