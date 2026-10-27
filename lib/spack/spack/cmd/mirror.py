@@ -499,6 +499,18 @@ def _configure_mirror(args):
         changes["access_pair"] = access_pair
     signed = _signed_setting(args, changes.get("url") or entry.get_url(direction or "fetch"))
     if signed is not None:
+        existing = entry._cosign_config()
+        if existing and signed is True:
+            # It already is signed, and `true` would replace the key or identity that says how:
+            # OCI registries cannot be signed with GPG
+            tty.msg(
+                f"Mirror {args.name} is already signed with cosign, keeping its configuration. "
+                "Use --cosign-key to change the key."
+            )
+            signed = None
+        elif existing and signed is False:
+            tty.warn(f"Removing the cosign configuration of mirror {args.name}: {dict(existing)}")
+    if signed is not None:
         changes["signed"] = signed
     if getattr(args, "autopush", None) is not None:
         changes["autopush"] = args.autopush

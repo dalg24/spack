@@ -848,3 +848,30 @@ def test_mirror_cosign_key_requires_oci(mutable_config: Configuration, command):
 def test_mirror_cosign_key_excludes_signed(mutable_config: Configuration):
     with pytest.raises(SpackCommandError, match="exit code 2"):
         mirror("add", "--signed", "--cosign-key", "k", "example", "oci://example.com/image")
+
+
+def test_mirror_set_signed_keeps_the_cosign_configuration(mutable_config: Configuration):
+    """`signed: true` cannot be honored for an OCI registry, so it must not replace the key or
+    the identity of a mirror that already is signed."""
+    mirror("add", "--cosign-key", "k.pub", "example", "oci://example.com/image")
+    mirror("set", "--signed", "example")
+    assert mutable_config.get("mirrors:example:signed") == {"method": "cosign", "key": "k.pub"}
+
+
+def test_mirror_set_unsigned_says_what_it_removes(mutable_config: Configuration, monkeypatch):
+    warnings = []
+    monkeypatch.setattr(spack.cmd.mirror.tty, "warn", lambda *a, **k: warnings.append(a))
+    mirror("add", "--cosign-key", "k.pub", "example", "oci://example.com/image")
+    mirror("set", "--unsigned", "example")
+    assert mutable_config.get("mirrors:example:signed") is False
+    assert any("k.pub" in str(w) for w in warnings)
+
+
+def test_mirror_set_unsigned_on_an_unsigned_mirror_is_quiet(
+    mutable_config: Configuration, monkeypatch
+):
+    warnings = []
+    monkeypatch.setattr(spack.cmd.mirror.tty, "warn", lambda *a, **k: warnings.append(a))
+    mirror("add", "example", "https://example.com/cache")
+    mirror("set", "--unsigned", "example")
+    assert not warnings
