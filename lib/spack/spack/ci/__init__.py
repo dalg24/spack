@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 import zipfile
 from collections import namedtuple
-from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 from urllib.request import Request
 
 import spack
@@ -30,6 +30,7 @@ import spack.repo
 import spack.spec
 import spack.stage
 import spack.store
+import spack.util.cosign
 import spack.util.filesystem as fs
 import spack.util.git
 import spack.util.gpg as gpg_util
@@ -654,7 +655,7 @@ def push_to_build_cache(spec: spack.spec.Spec, mirror_url: str, sign_binaries: b
         sign_binaries: If True, spack will attempt to sign binary package before pushing.
     """
     mirror = _mirror_for_url(mirror_url)
-    signing_key: Optional[str] = None
+    signing_key: Union[str, spack.util.cosign.KeylessSigner, None] = None
     if spack.oci.image.is_oci_url(mirror_url):
         # OCI images are signed with cosign, using the key configured for the mirror. GPG keys
         # are for other build caches, and cannot be used here.

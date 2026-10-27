@@ -679,16 +679,58 @@ def test_install_without_a_pinned_signer_is_refused(recording_cosign):
     assert not recording_cosign.verified
 
 
-def test_buildcache_push_to_keyless_mirror_fails_instead_of_pushing_unsigned(
-    mutable_database, recording_cosign
-):
-    """Keyless signing is only supported for installing. Pushing must not silently produce
-    unsigned images to a mirror that requires signatures."""
+class _FakeKeylessSigning(_KeylessCosign):
+    """Signs as ``signer``, as cosign does with the identity token of the CI job."""
+
+    def __init__(self, signer: str, no_token: bool = False):
+        super().__init__(signer=signer)
+        self.no_token = no_token
+        self.sign_calls = []
+
+    def __call__(self, *args, **kwargs):
+        if args[0] == "sign":
+            self.sign_calls.append(args)
+            if self.no_token:
+                raise spack.util.executable.ProcessError("retrieving ID token: empty input")
+        return super().__call__(*args, **kwargs)
+
+
+def test_buildcache_push_keyless_signs_and_checks_the_identity(mutable_database, monkeypatch):
+    cosign = _FakeKeylessSigning(signer=_IDENTITY)
+    monkeypatch.setattr(spack.util.cosign, "_COSIGN", cosign)
+    monkeypatch.setattr(spack.util.cosign, "_COSIGN_MAJOR", None)
     registry = InMemoryOCIRegistry("example.com")
     with oci_servers(registry):
         _keyless_mirror(identity=_IDENTITY, issuer=_ISSUER)
-        with pytest.raises(spack.error.SpackError, match="keyless signing"):
+        buildcache("push", "oci-test", "mpich")
+
+    # Every spec image was signed without a key, and checked against the configured identity
+    spec_tags = [tag for (_, tag) in registry.manifests if tag.endswith(".spack")]
+    assert spec_tags and len(cosign.sign_calls) == len(spec_tags)
+    for call in cosign.sign_calls:
+        assert "--key" not in call
+        assert "--fulcio-auth-flow=token" in call  # never an interactive login
+        assert call[-1].startswith("example.com/image@sha256:")
+    assert len(cosign.verify_calls) == len(spec_tags)
+
+
+def test_buildcache_push_keyless_as_another_identity_fails(mutable_database, monkeypatch):
+    """A job that runs as a different identity than the mirror trusts would publish images that
+    every client refuses. It must fail instead."""
+    cosign = _FakeKeylessSigning(signer="https://github.com/other/repo/.github/workflows/x.yml@r")
+    monkeypatch.setattr(spack.util.cosign, "_COSIGN", cosign)
+    monkeypatch.setattr(spack.util.cosign, "_COSIGN_MAJOR", None)
+    with oci_servers(InMemoryOCIRegistry("example.com")):
+        _keyless_mirror(identity=_IDENTITY, issuer=_ISSUER)
+        with pytest.raises(spack.error.SpackError, match="not by the identity"):
             buildcache("push", "oci-test", "mpich")
 
-    assert not recording_cosign.signed
-    assert not registry.manifests  # nothing was pushed
+
+def test_buildcache_push_keyless_without_identity_token_fails(mutable_database, monkeypatch):
+    cosign = _FakeKeylessSigning(signer=_IDENTITY, no_token=True)
+    monkeypatch.setattr(spack.util.cosign, "_COSIGN", cosign)
+    monkeypatch.setattr(spack.util.cosign, "_COSIGN_MAJOR", None)
+    with oci_servers(InMemoryOCIRegistry("example.com")):
+        _keyless_mirror(identity=_IDENTITY, issuer=_ISSUER)
+        with pytest.raises(spack.error.SpackError, match="allowed to request an identity token"):
+            buildcache("push", "oci-test", "mpich")

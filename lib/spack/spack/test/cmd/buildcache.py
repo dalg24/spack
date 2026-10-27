@@ -24,6 +24,7 @@ import spack.error
 import spack.main
 import spack.mirrors.mirror
 import spack.spec
+import spack.util.cosign
 import spack.util.url as url_util
 import spack.util.web as web_util
 from spack.active_environment import active_environment
@@ -1641,12 +1642,12 @@ def test_autopush_signs_oci_images_with_the_cosign_key(mutable_config, autopush_
     assert keys == ["ci.key"]
 
 
-def test_autopush_does_not_push_unsigned_to_a_keyless_oci_mirror(mutable_config, autopush_uploads):
+def test_autopush_signs_keyless_oci_images(mutable_config, autopush_uploads):
     post_install, keys = autopush_uploads
     _autopush_oci_mirror(
         mutable_config,
         {"method": "cosign", "identity": "https://x/y", "issuer": "https://token.example.com"},
     )
-    with pytest.raises(spack.error.SpackError, match="keyless signing"):
-        post_install(_FakeSpec(), True)
-    assert keys == []
+    post_install(_FakeSpec(), True)
+    (signer,) = keys
+    assert isinstance(signer, spack.util.cosign.KeylessSigner)

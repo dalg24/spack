@@ -1231,11 +1231,11 @@ class OCIUploader(Uploader):
         force: bool,
         update_index: bool,
         base_image: Optional[str],
-        signing_key: Optional[str] = None,
+        signing_key: Union[str, spack.util.cosign.KeylessSigner, None] = None,
     ) -> None:
         super().__init__(mirror, force, update_index)
         self.signing_key = signing_key
-        if signing_key:
+        if isinstance(signing_key, str):
             # Ask for the password of the key now, since signing happens in worker threads
             spack.util.cosign.prepare_signing_key(signing_key)
         self.target_image = spack.oci.oci.image_from_mirror(mirror)
@@ -1319,7 +1319,7 @@ def make_uploader(
     mirror: spack.mirrors.mirror.Mirror,
     force: bool = False,
     update_index: bool = False,
-    signing_key: Optional[str] = None,
+    signing_key: Union[str, spack.util.cosign.KeylessSigner, None] = None,
     base_image: Optional[str] = None,
 ) -> Uploader:
     """Builder for the appropriate uploader based on the mirror type"""
@@ -1333,6 +1333,10 @@ def make_uploader(
             signing_key=signing_key,
         )
     else:
+        if isinstance(signing_key, spack.util.cosign.KeylessSigner):
+            raise spack.error.SpackError(
+                "Keyless signing with cosign is only supported for OCI registries"
+            )
         return URLUploader(
             mirror=mirror, force=force, update_index=update_index, signing_key=signing_key
         )
@@ -1553,7 +1557,7 @@ def _oci_put_manifest(
     extra_config: Optional[dict],
     annotations: Optional[dict],
     *specs: spack.spec.Spec,
-    signing_key: Optional[str] = None,
+    signing_key: Union[str, spack.util.cosign.KeylessSigner, None] = None,
 ):
     architecture = _oci_archspec_to_gooarch(specs[0])
 
@@ -1648,11 +1652,12 @@ def _oci_put_manifest(
 
     # Sign the digest we just uploaded, not the tag, which may move
     if signing_key:
-        spack.util.cosign.sign_image(
-            f"{image_ref.domain}/{image_ref.name}@{digest}",
-            signing_key,
-            insecure_registry=image_ref.scheme == "http",
-        )
+        image = f"{image_ref.domain}/{image_ref.name}@{digest}"
+        insecure_registry = image_ref.scheme == "http"
+        if isinstance(signing_key, spack.util.cosign.KeylessSigner):
+            signing_key.sign(image, insecure_registry)
+        else:
+            spack.util.cosign.sign_image(image, signing_key, insecure_registry=insecure_registry)
 
 
 def _oci_update_base_images(
@@ -1701,7 +1706,7 @@ def _oci_push(
     tmpdir: str,
     executor: concurrent.futures.Executor,
     force: bool = False,
-    signing_key: Optional[str] = None,
+    signing_key: Union[str, spack.util.cosign.KeylessSigner, None] = None,
 ) -> Tuple[
     List[spack.spec.Spec],
     Dict[str, Tuple[dict, dict]],
@@ -1910,23 +1915,24 @@ def _oci_update_index(
         upload_manifest_with_retry(image_ref.with_tag(default_index_tag), oci_manifest)
 
 
-def oci_signing_key(mirror: spack.mirrors.mirror.Mirror, override: Optional[str] = None) -> str:
-    """Return the cosign key to sign images with when pushing to an OCI mirror.
+def oci_signing_key(
+    mirror: spack.mirrors.mirror.Mirror, override: Optional[str] = None
+) -> Union[str, spack.util.cosign.KeylessSigner]:
+    """Return how to sign images when pushing to an OCI mirror: a cosign key, or a signer for the
+    keyless identity the mirror is configured with.
 
     Raises:
-        spack.error.SpackError: if the mirror cannot be signed with a key. This never returns
-            nothing, since pushing unsigned images to a mirror that requires signatures would
-            silently defeat the signing.
+        spack.error.SpackError: if the mirror cannot be signed. This never returns nothing,
+            since pushing unsigned images to a mirror that requires signatures would silently
+            defeat the signing.
     """
     key = override or mirror.cosign_key
     if key:
         return key
     if mirror.cosign_identity:
-        raise spack.error.SpackError(
-            f"Mirror {mirror.name} is configured for keyless signing, which is only supported "
-            "for installing from it. Pushing needs a cosign key: pass --key, or set `key` "
-            "instead of `identity`."
-        )
+        # Only the identity of the signer is configured, which is what clients check. Signing
+        # uses the identity the CI job runs as, and is checked against it.
+        return spack.util.cosign.KeylessSigner(**mirror.cosign_identity)
     raise spack.error.SpackError(
         "Signing OCI images requires a cosign key. Set `signed: {method: cosign, key: ...}` on "
         "the mirror, or pass --key."

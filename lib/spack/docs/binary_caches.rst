@@ -525,8 +525,7 @@ Trusting an Identity Instead of a Key
 
 .. warning::
 
-   Verifying keyless signatures is experimental: it has not been tested against a real Sigstore instance, since that needs a CI job with an identity token.
-   Spack can not yet *create* keyless signatures.
+   Keyless signing and verification are experimental: they have not been tested against a real Sigstore instance, since that needs a CI job with an identity token.
 
 Instead of a key, a mirror can say who produced the images, for example a CI workflow.
 Images signed by that workflow with Sigstore's keyless flow are then trusted, without a key to distribute and protect:
@@ -551,9 +550,17 @@ Such certificates are only valid for minutes, so cosign checks that the signatur
 Verifying therefore needs access to the network, and cannot be done offline as it can with a key.
 For a private Sigstore deployment, set ``trusted_root`` to the path of its trusted root file.
 
-Pushing to a mirror that is configured this way fails, instead of pushing images that clients would refuse.
+Pushing to a mirror that is configured this way signs the images with the identity of the CI job, and then checks the signature against the identity of the mirror.
+If the job runs as someone else, the push fails, instead of publishing images that clients would refuse.
+Cosign reads the identity token from the environment of the job, so the job must be allowed to request one:
+
+* In GitHub Actions, the job needs ``permissions: id-token: write``.
+* In GitLab CI, the job needs an ``id_tokens:`` entry whose ``aud`` is ``sigstore``, and its token must be passed to cosign in ``SIGSTORE_ID_TOKEN``.
+
+Spack never starts an interactive login: without an identity token, signing fails and says so.
+The push needs access to the network, to reach Sigstore.
+
 Images signed with a key cannot be verified with an identity, or the other way around: the mirror has to be configured for the way its images were signed.
-Until Spack can create keyless signatures itself, only images signed with ``cosign sign`` in a CI job can be installed this way.
 
 .. _oci-authentication:
 

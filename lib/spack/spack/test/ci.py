@@ -16,6 +16,7 @@ import spack.error
 import spack.paths
 import spack.reporters.cdash
 import spack.spec
+import spack.util.cosign
 import spack.util.filesystem as fs
 import spack.util.git
 from spack import ci, repo
@@ -796,14 +797,31 @@ _KEYLESS = {
 }
 
 
-def test_push_to_keyless_oci_build_cache_fails_instead_of_pushing_unsigned(
-    mutable_config, recorded_uploaders, capfd
-):
-    """Keyless signing is only supported for installing, and pushing unsigned images to a
-    mirror that requires signatures would defeat it. The job must fail, like any failed push."""
+def test_push_to_keyless_oci_build_cache_signs_without_a_key(mutable_config, recorded_uploaders):
     mutable_config.set(
         "mirrors:ci", {"url": "oci://example.com/image", "signed": _KEYLESS}, scope="user"
     )
-    assert ci.push_to_build_cache(spack.spec.Spec(), "oci://example.com/image", True) is False
-    assert recorded_uploaders == []  # nothing was pushed, signed or not
-    assert "keyless signing" in capfd.readouterr().err
+    assert ci.push_to_build_cache(spack.spec.Spec(), "oci://example.com/image", False) is True
+    (signer,) = recorded_uploaders
+    assert isinstance(signer, spack.util.cosign.KeylessSigner)
+    assert signer.identity == _KEYLESS["identity"] and signer.issuer == _KEYLESS["issuer"]
+
+
+def test_push_to_oci_build_cache_that_cannot_be_signed_fails(
+    mutable_config, recorded_uploaders, monkeypatch, capfd
+):
+    """If signing cannot be set up for a mirror that requires signatures, the push fails, and
+    does not fall back to pushing unsigned images."""
+    mutable_config.set(
+        "mirrors:ci",
+        {"url": "oci://example.com/image", "signed": {"method": "cosign", "key": "k"}},
+        scope="user",
+    )
+
+    def no_way_to_sign(mirror, override=None):
+        raise spack.error.SpackError("cannot sign")
+
+    monkeypatch.setattr(spack.binary_distribution, "oci_signing_key", no_way_to_sign)
+    assert ci.push_to_build_cache(spack.spec.Spec(), "oci://example.com/image", False) is False
+    assert recorded_uploaders == []
+    assert "Cannot sign images" in capfd.readouterr().err

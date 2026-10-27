@@ -10,7 +10,7 @@ import os
 import sys
 import tempfile
 import warnings
-from typing import List, Mapping, Optional, Tuple
+from typing import List, Mapping, Optional, Tuple, Union
 
 import spack.binary_distribution
 import spack.cmd
@@ -25,6 +25,7 @@ import spack.oci.oci
 import spack.spec
 import spack.stage
 import spack.store
+import spack.util.cosign
 import spack.util.parallel
 import spack.util.timer as timer_mod
 import spack.util.web as web_util
@@ -529,7 +530,7 @@ def push_fn(args):
 
     # Select a signing key, or None if unsigned. OCI images are signed with cosign, other
     # build caches with GPG.
-    signing_key: Optional[str] = None
+    signing_key: Union[str, spack.util.cosign.KeylessSigner, None] = None
     if not unsigned and spack.oci.image.is_oci_url(mirror.push_url):
         signing_key = spack.binary_distribution.oci_signing_key(mirror, args.key)
     elif not unsigned:

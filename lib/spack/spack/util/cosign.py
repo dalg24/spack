@@ -242,3 +242,75 @@ def verify_image_keyless(
         raise CosignError(
             f"cosign could not verify that {ref} was signed by the expected identity: {e}"
         ) from e
+
+
+def sign_image_keyless(ref: str, insecure_registry: bool = False) -> None:
+    """Sign an image with a short-lived certificate that Sigstore issues to the identity the CI
+    job runs as, which cosign finds in the environment of the job.
+
+    This contacts Sigstore, so it needs access to the network, and a CI job with permission to
+    request an identity token.
+
+    Args:
+        ref: image reference *by digest*
+        insecure_registry: the registry speaks plain http
+
+    Raises:
+        CosignError: if signing fails, in particular when there is no identity to sign as
+    """
+    _require_digest(ref)
+    _check_version()
+    try:
+        _cosign()(
+            "sign",
+            "--yes",
+            # Only use a token from the environment of the job. Cosign would otherwise fall back
+            # to logging in interactively, which cannot be seen while its output is captured.
+            "--fulcio-auth-flow=token",
+            *_registry_args(insecure_registry),
+            ref,
+            output=str,
+            error=str,
+        )
+    except spack.util.executable.ProcessError as e:
+        raise CosignError(
+            f"cosign failed to sign {ref} without a key. This needs to run in a CI job that is "
+            f"allowed to request an identity token: {e}"
+        ) from e
+
+
+class KeylessSigner:
+    """Signs images without a key, and checks the signature is from the identity expected by
+    clients, so that a job running as the wrong identity fails instead of publishing images that
+    no one will install."""
+
+    def __init__(
+        self,
+        issuer: str,
+        identity: Optional[str] = None,
+        identity_regexp: Optional[str] = None,
+        trusted_root: Optional[str] = None,
+    ):
+        if bool(identity) == bool(identity_regexp):
+            raise CosignError("specify exactly one of an identity and an identity pattern")
+        self.issuer = issuer
+        self.identity = identity
+        self.identity_regexp = identity_regexp
+        self.trusted_root = trusted_root
+
+    def sign(self, ref: str, insecure_registry: bool = False) -> None:
+        sign_image_keyless(ref, insecure_registry)
+        try:
+            verify_image_keyless(
+                ref,
+                issuer=self.issuer,
+                identity=self.identity,
+                identity_regexp=self.identity_regexp,
+                trusted_root=self.trusted_root,
+                insecure_registry=insecure_registry,
+            )
+        except CosignError as e:
+            raise CosignError(
+                f"{ref} was signed, but not by the identity that the mirror is configured to "
+                f"trust, so clients would refuse it. Check which identity this job runs as: {e}"
+            ) from e

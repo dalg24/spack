@@ -286,3 +286,70 @@ def test_old_cosign_cannot_verify_keyless(monkeypatch):
     with pytest.raises(cosign.CosignError, match="not supported"):
         cosign.verify_image_keyless(f"example.com/img@{DIGEST}", issuer=ISSUER, identity=IDENTITY)
     assert not fake.calls
+
+
+def test_sign_keyless(fake_cosign):
+    cosign.sign_image_keyless(f"example.com/img@{DIGEST}")
+    (args,) = fake_cosign.calls
+    assert args[0] == "sign" and args[-1] == f"example.com/img@{DIGEST}"
+    assert "--key" not in args
+
+
+def test_sign_keyless_never_logs_in_interactively(fake_cosign):
+    """Cosign would fall back to an interactive login without an identity token, which cannot
+    be seen or answered while its output is captured."""
+    cosign.sign_image_keyless(f"example.com/img@{DIGEST}")
+    assert "--fulcio-auth-flow=token" in fake_cosign.calls[0]
+
+
+def test_sign_keyless_plain_http_registry(fake_cosign):
+    cosign.sign_image_keyless(f"localhost:5000/img@{DIGEST}", insecure_registry=True)
+    assert "--allow-http-registry" in fake_cosign.calls[0]
+
+
+def test_sign_keyless_tag_is_refused(fake_cosign):
+    with pytest.raises(cosign.CosignError, match="digest reference"):
+        cosign.sign_image_keyless("example.com/img:latest")
+    assert not fake_cosign.calls
+
+
+def test_sign_keyless_failure_says_what_is_needed(monkeypatch):
+    _install(monkeypatch, FakeCosign(fail=True))
+    with pytest.raises(cosign.CosignError, match="identity token"):
+        cosign.sign_image_keyless(f"example.com/img@{DIGEST}")
+
+
+def test_keyless_signer_signs_then_verifies_the_identity(fake_cosign):
+    signer = cosign.KeylessSigner(issuer=ISSUER, identity=IDENTITY)
+    signer.sign(f"example.com/img@{DIGEST}")
+    sign, verify = fake_cosign.calls
+    assert sign[0] == "sign" and verify[0] == "verify"
+    assert verify[verify.index("--certificate-identity") + 1] == IDENTITY
+    assert verify[verify.index("--certificate-oidc-issuer") + 1] == ISSUER
+
+
+def test_keyless_signer_fails_when_signed_as_another_identity(monkeypatch):
+    """The signature is made, but by someone clients do not trust: that must be an error."""
+    fake = FakeCosign()
+
+    def reject_verify(*args, **kwargs):
+        if args[0] == "verify":
+            raise ProcessError("no matching signatures")
+
+    fake.on_call = reject_verify
+    _install(monkeypatch, fake)
+    with pytest.raises(cosign.CosignError, match="not by the identity"):
+        cosign.KeylessSigner(issuer=ISSUER, identity=IDENTITY).sign(f"example.com/img@{DIGEST}")
+
+
+def test_keyless_signer_does_not_verify_when_signing_failed(monkeypatch):
+    fake = _install(monkeypatch, FakeCosign(fail=True))
+    with pytest.raises(cosign.CosignError, match="identity token"):
+        cosign.KeylessSigner(issuer=ISSUER, identity=IDENTITY).sign(f"example.com/img@{DIGEST}")
+    assert [call[0] for call in fake.calls] == ["sign"]
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"identity": IDENTITY, "identity_regexp": "x"}])
+def test_keyless_signer_needs_exactly_one_identity(kwargs):
+    with pytest.raises(cosign.CosignError):
+        cosign.KeylessSigner(issuer=ISSUER, **kwargs)

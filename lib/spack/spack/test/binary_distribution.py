@@ -32,6 +32,7 @@ import spack.spec
 import spack.stage
 import spack.store
 import spack.url_buildcache
+import spack.util.cosign
 import spack.util.gpg
 import spack.util.spack_yaml as syaml
 import spack.util.url as url_util
@@ -2087,3 +2088,12 @@ def test_url_update_index_raises_after_retries_exhausted(tmp_path, create_mock_i
     assert _Handler.push_count == 5
     # We should call .update on every attempt, so each retry picks up a fresh etag
     assert mock_index.update_calls == [metadata] * 5
+
+
+def test_keyless_signer_is_refused_for_other_build_caches(tmp_path):
+    """Keyless signing with cosign only exists for OCI registries. Handing the signer to the
+    uploader of another build cache must not quietly push images that are not signed."""
+    mirror = spack.mirrors.mirror.Mirror.from_local_path(str(tmp_path))
+    signer = spack.util.cosign.KeylessSigner(issuer="https://issuer.example.com", identity="me")
+    with pytest.raises(spack.error.SpackError, match="only supported for OCI"):
+        spack.binary_distribution.make_uploader(mirror, signing_key=signer)
