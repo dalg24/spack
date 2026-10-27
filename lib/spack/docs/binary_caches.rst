@@ -489,7 +489,10 @@ Pushing needs the private key, and installing needs the matching public key, so 
     $ spack mirror set --cosign-key cosign.pub my_registry  # on machines that only install
 
 A key pair can be created with ``cosign generate-key-pair``.
-If the private key is encrypted, set ``COSIGN_PASSWORD`` in the environment; Spack does not prompt for it.
+Cosign private key files are always password protected, even if the password is empty.
+When pushing from a terminal, Spack asks for the password once.
+Without a terminal, for example in CI, set ``COSIGN_PASSWORD`` in the environment instead, to an empty value if the key has no password; otherwise the push fails.
+Keys that are not files, such as KMS URIs, do not need a password.
 You can also pass a key to a single push with ``spack buildcache push --key <key> <mirror> <specs...>``.
 
 When pushing, Spack signs the digest of the manifest of each image it uploads, and the push fails if signing fails.

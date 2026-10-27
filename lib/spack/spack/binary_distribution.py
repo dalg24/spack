@@ -1235,6 +1235,9 @@ class OCIUploader(Uploader):
     ) -> None:
         super().__init__(mirror, force, update_index)
         self.signing_key = signing_key
+        if signing_key:
+            # Ask for the password of the key now, since signing happens in worker threads
+            spack.util.cosign.prepare_signing_key(signing_key)
         self.target_image = spack.oci.oci.image_from_mirror(mirror)
         self.base_image = ImageReference.from_string(base_image) if base_image else None
 

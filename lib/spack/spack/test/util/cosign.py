@@ -2,6 +2,8 @@
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 import json
+import os
+import sys
 
 import pytest
 
@@ -123,3 +125,72 @@ def test_cosign_failure_raises(monkeypatch, fn):
     _install(monkeypatch, FakeCosign(fail=True))
     with pytest.raises(cosign.CosignError, match="boom"):
         fn(f"example.com/img@{DIGEST}", "key")
+
+
+@pytest.fixture
+def key_file(tmp_path, monkeypatch):
+    path = tmp_path / "cosign.key"
+    path.write_text("-----BEGIN ENCRYPTED SIGSTORE PRIVATE KEY-----\n")
+    monkeypatch.delenv("COSIGN_PASSWORD", raising=False)
+    monkeypatch.setattr(cosign, "_PASSWORD", None)
+    return str(path)
+
+
+def _terminal(monkeypatch, isatty: bool, answer: str = "secret"):
+    prompts = []
+    monkeypatch.setattr(sys, "stdin", type("Stdin", (), {"isatty": lambda self: isatty})())
+    monkeypatch.setattr(cosign.getpass, "getpass", lambda prompt: prompts.append(prompt) or answer)
+    return prompts
+
+
+def test_password_is_asked_once_and_only_given_to_cosign(fake_cosign, key_file, monkeypatch):
+    prompts = _terminal(monkeypatch, isatty=True)
+    envs = []
+    fake_cosign.on_call = lambda *args, **kwargs: envs.append(kwargs.get("extra_env"))
+
+    cosign.prepare_signing_key(key_file)
+    for _ in range(3):
+        cosign.sign_image(f"example.com/img@{DIGEST}", key_file)
+
+    assert len(prompts) == 1 and key_file in prompts[0]
+    assert envs == [{"COSIGN_PASSWORD": "secret"}] * 3
+    assert "COSIGN_PASSWORD" not in os.environ
+
+
+def test_environment_password_is_not_asked_for(fake_cosign, key_file, monkeypatch):
+    prompts = _terminal(monkeypatch, isatty=True)
+    monkeypatch.setenv("COSIGN_PASSWORD", "")  # set but empty: the key has no password
+    envs = []
+    fake_cosign.on_call = lambda *args, **kwargs: envs.append(kwargs.get("extra_env"))
+
+    cosign.prepare_signing_key(key_file)
+    cosign.sign_image(f"example.com/img@{DIGEST}", key_file)
+
+    assert not prompts
+    assert envs == [None]  # cosign reads it from the environment itself
+
+
+def test_no_password_without_terminal_is_an_error(fake_cosign, key_file, monkeypatch):
+    prompts = _terminal(monkeypatch, isatty=False)
+    with pytest.raises(cosign.CosignError, match="COSIGN_PASSWORD"):
+        cosign.prepare_signing_key(key_file)
+    assert not prompts
+
+
+def test_signing_never_prompts_by_itself(fake_cosign, key_file, monkeypatch):
+    """sign_image runs in worker threads, where a prompt would be invisible, so it must fail
+    instead of letting cosign ask."""
+    prompts = _terminal(monkeypatch, isatty=True)
+    with pytest.raises(cosign.CosignError, match="COSIGN_PASSWORD"):
+        cosign.sign_image(f"example.com/img@{DIGEST}", key_file)
+    assert not prompts and not fake_cosign.calls
+
+
+@pytest.mark.parametrize("key", ["awskms:///arn:aws:kms:key", "hashivault://key", "/no/such/file"])
+def test_keys_that_are_not_files_are_not_asked_for(fake_cosign, monkeypatch, key):
+    monkeypatch.delenv("COSIGN_PASSWORD", raising=False)
+    monkeypatch.setattr(cosign, "_PASSWORD", None)
+    prompts = _terminal(monkeypatch, isatty=True)
+    cosign.prepare_signing_key(key)
+    cosign.sign_image(f"example.com/img@{DIGEST}", key)
+    assert not prompts and len(fake_cosign.calls) == 1

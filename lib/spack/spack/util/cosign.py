@@ -5,9 +5,11 @@
 key. Neither signing nor verification contacts any Sigstore service, so this works on machines
 without access to the public internet. Cosign 2 and 3 are supported."""
 
+import getpass
 import json
 import os
 import re
+import sys
 import tempfile
 from typing import List, Optional
 
@@ -17,6 +19,9 @@ from spack.util.executable import Executable
 
 #: Executable instance for "cosign", initialized lazily
 _COSIGN: Optional[Executable] = None
+
+#: Password of the private key, if it was asked for. It is only handed to the cosign process.
+_PASSWORD: Optional[str] = None
 
 #: Major version of the cosign executable, determined on first use
 _COSIGN_MAJOR: Optional[int] = None
@@ -59,6 +64,39 @@ def _major_version() -> int:
     return _COSIGN_MAJOR
 
 
+def _needs_password(key: str) -> bool:
+    """Whether signing with this key needs a password that is not available yet. Only key files
+    are protected by a password. Other key references, like KMS URIs, are not."""
+    return os.path.isfile(key) and "COSIGN_PASSWORD" not in os.environ and _PASSWORD is None
+
+
+def prepare_signing_key(key: str) -> None:
+    """Ask for the password of a private key file, if needed, so that signing never has to.
+
+    Call this once from the main thread before signing: cosign would otherwise ask for the
+    password itself, which cannot be seen while Spack captures its output, and it would ask
+    for every image. The password is kept in memory and only given to cosign. If
+    ``COSIGN_PASSWORD`` is set, it is used instead, and an empty value means the key has no
+    password.
+
+    Raises:
+        CosignError: if the password is needed and cannot be asked for
+    """
+    global _PASSWORD
+    if not _needs_password(key):
+        return
+    if not sys.stdin.isatty():
+        raise CosignError(_NO_PASSWORD_MESSAGE.format(key=key))
+    _PASSWORD = getpass.getpass(f"Password for cosign key {key} (empty if it has none): ")
+
+
+_NO_PASSWORD_MESSAGE = (
+    "The password for the cosign key {key} is needed, but cannot be asked for without a "
+    "terminal. Set the COSIGN_PASSWORD environment variable, to an empty value if the key has "
+    "no password."
+)
+
+
 def _registry_args(insecure_registry: bool) -> List[str]:
     return ["--allow-http-registry"] if insecure_registry else []
 
@@ -74,6 +112,9 @@ def sign_image(ref: str, key: str, insecure_registry: bool = False) -> None:
         insecure_registry: the registry speaks plain http
     """
     _require_digest(ref)
+    if _needs_password(key):
+        # Never let cosign prompt: this may run in a thread, and the prompt would be invisible
+        raise CosignError(_NO_PASSWORD_MESSAGE.format(key=key))
     major = _major_version()
     if major < 2:
         raise CosignError(f"cosign {major} is not supported, use cosign 2 or newer")
@@ -96,6 +137,11 @@ def sign_image(ref: str, key: str, insecure_registry: bool = False) -> None:
                 ref,
                 output=str,
                 error=str,
+                extra_env=(
+                    {"COSIGN_PASSWORD": _PASSWORD}
+                    if _PASSWORD is not None and "COSIGN_PASSWORD" not in os.environ
+                    else None
+                ),
             )
         except spack.util.executable.ProcessError as e:
             raise CosignError(f"cosign failed to sign {ref}: {e}") from e
