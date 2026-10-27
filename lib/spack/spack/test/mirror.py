@@ -12,6 +12,7 @@ import pytest
 import spack.caches
 import spack.cmd.mirror
 import spack.concretize
+import spack.error
 import spack.fetch_strategy
 import spack.mirrors.layout
 import spack.mirrors.mirror
@@ -489,3 +490,64 @@ def test_mirror_matches(mock_packages, mutable_config):
     )
     assert m.matches_binary(spec, direction="fetch") is False
     assert m.matches_binary(spec, direction="push") is True
+
+
+_ISSUER = "https://token.actions.githubusercontent.com"
+_IDENTITY = "https://github.com/org/repo/.github/workflows/ci.yml@refs/heads/main"
+
+
+def test_mirror_cosign_with_key():
+    m = spack.mirrors.mirror.Mirror(
+        {"url": "oci://example.com/img", "signed": {"method": "cosign", "key": "k.pub"}}, name="m"
+    )
+    assert m.signed and m.cosign_key == "k.pub" and m.cosign_identity is None
+
+
+def test_mirror_cosign_keyless():
+    m = spack.mirrors.mirror.Mirror(
+        {
+            "url": "oci://example.com/img",
+            "signed": {"method": "cosign", "identity": _IDENTITY, "issuer": _ISSUER},
+        },
+        name="m",
+    )
+    assert m.signed and m.cosign_key is None
+    assert m.cosign_identity == {"identity": _IDENTITY, "issuer": _ISSUER}
+
+
+def test_mirror_cosign_keyless_trusted_root_and_pattern():
+    m = spack.mirrors.mirror.Mirror(
+        {
+            "url": "oci://example.com/img",
+            "signed": {
+                "method": "cosign",
+                "identity_regexp": "https://github.com/org/.*",
+                "issuer": _ISSUER,
+                "trusted_root": "root.json",
+            },
+        },
+        name="m",
+    )
+    assert m.cosign_identity == {
+        "identity_regexp": "https://github.com/org/.*",
+        "issuer": _ISSUER,
+        "trusted_root": "root.json",
+    }
+
+
+@pytest.mark.parametrize(
+    "signed",
+    [
+        {"method": "cosign"},  # who signs?
+        {"method": "cosign", "identity": _IDENTITY},  # vouched for by whom?
+        {"method": "cosign", "issuer": _ISSUER},  # which identity?
+        {"method": "cosign", "key": "k", "identity": _IDENTITY, "issuer": _ISSUER},  # which one?
+        {"method": "cosign", "identity": _IDENTITY, "identity_regexp": "x", "issuer": _ISSUER},
+        {"method": "cosign", "key": "k", "trusted_root": "root.json"},  # only for keyless
+    ],
+)
+def test_mirror_cosign_ambiguous_config_is_rejected(mutable_config, signed):
+    with pytest.raises(spack.error.ConfigError):
+        mutable_config.set(
+            "mirrors", {"m": {"url": "oci://example.com/img", "signed": signed}}, scope="user"
+        )

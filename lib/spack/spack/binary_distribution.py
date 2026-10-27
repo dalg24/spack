@@ -1910,6 +1910,53 @@ def _oci_update_index(
         upload_manifest_with_retry(image_ref.with_tag(default_index_tag), oci_manifest)
 
 
+def oci_signing_key(mirror: spack.mirrors.mirror.Mirror, override: Optional[str] = None) -> str:
+    """Return the cosign key to sign images with when pushing to an OCI mirror.
+
+    Raises:
+        spack.error.SpackError: if the mirror cannot be signed with a key. This never returns
+            nothing, since pushing unsigned images to a mirror that requires signatures would
+            silently defeat the signing.
+    """
+    key = override or mirror.cosign_key
+    if key:
+        return key
+    if mirror.cosign_identity:
+        raise spack.error.SpackError(
+            f"Mirror {mirror.name} is configured for keyless signing, which is only supported "
+            "for installing from it. Pushing needs a cosign key: pass --key, or set `key` "
+            "instead of `identity`."
+        )
+    raise spack.error.SpackError(
+        "Signing OCI images requires a cosign key. Set `signed: {method: cosign, key: ...}` on "
+        "the mirror, or pass --key."
+    )
+
+
+def _oci_verify_signature(
+    mirror: spack.mirrors.mirror.Mirror, image: str, ref: ImageReference
+) -> None:
+    """Verify an image by digest against what the mirror is configured to trust.
+
+    Raises:
+        spack.util.cosign.CosignError: if the image is not signed by who the mirror trusts, or if
+            the mirror is not configured to say who that is
+    """
+    insecure_registry = ref.scheme == "http"
+    if mirror.cosign_key:
+        spack.util.cosign.verify_image(image, mirror.cosign_key, insecure_registry)
+    elif mirror.cosign_identity:
+        spack.util.cosign.verify_image_keyless(
+            image, insecure_registry=insecure_registry, **mirror.cosign_identity
+        )
+    else:
+        # Never accept a signature without knowing whose it should be
+        raise spack.util.cosign.CosignError(
+            f"mirror {mirror.name} requires signatures, but is not configured with a key or "
+            "the identity of the signer"
+        )
+
+
 def download_tarball(
     spec: spack.spec.Spec,
     unsigned: Optional[bool] = False,
@@ -1995,14 +2042,11 @@ def download_tarball(
 
             # Verify the signature of the exact bytes we got. The config and layer digests used
             # below come from this verified manifest, and are checksummed when fetched.
-            cosign_key = mirror.cosign_key
-            if cosign_key and not currently_unsigned:
+            if mirror.signed and not currently_unsigned:
                 manifest_digest = Digest.from_sha256(hashlib.sha256(manifest_bytes).hexdigest())
                 try:
-                    spack.util.cosign.verify_image(
-                        f"{ref.domain}/{ref.name}@{manifest_digest}",
-                        cosign_key,
-                        insecure_registry=ref.scheme == "http",
+                    _oci_verify_signature(
+                        mirror, f"{ref.domain}/{ref.name}@{manifest_digest}", ref
                     )
                 except spack.util.cosign.CosignError as e:
                     tty.error(

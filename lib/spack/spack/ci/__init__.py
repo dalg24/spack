@@ -21,6 +21,7 @@ import spack.binary_distribution
 import spack.builder
 import spack.config as cfg
 import spack.environment as ev
+import spack.error
 import spack.main
 import spack.mirrors.mirror
 import spack.oci.image
@@ -657,7 +658,13 @@ def push_to_build_cache(spec: spack.spec.Spec, mirror_url: str, sign_binaries: b
     if spack.oci.image.is_oci_url(mirror_url):
         # OCI images are signed with cosign, using the key configured for the mirror. GPG keys
         # are for other build caches, and cannot be used here.
-        signing_key = mirror.cosign_key
+        if mirror.signed:
+            try:
+                signing_key = spack.binary_distribution.oci_signing_key(mirror)
+            except spack.error.SpackError as e:
+                # Report it like any other failed push, instead of pushing unsigned images
+                tty.error(f"Cannot sign images for {mirror_url}: {e}")
+                return False
     elif sign_binaries:
         signing_key = spack.binary_distribution.select_signing_key()
     tty.debug(f"Pushing to build cache ({'signed' if signing_key else 'unsigned'})")

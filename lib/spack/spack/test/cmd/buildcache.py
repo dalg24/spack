@@ -1583,3 +1583,70 @@ def test_buildcache_push_group_requires_active_env(tmp_path: pathlib.Path):
 
     with pytest.raises(spack.main.SpackCommandError):
         buildcache("push", "--unsigned", "--group", "default", str(mirror_dir), fail_on_error=True)
+
+
+class _FakePackage:
+    installed_from_binary_cache = False
+
+
+class _FakeSpec:
+    name = "pkg"
+    external = False
+    package = _FakePackage()
+
+    def __init__(self):
+        pass
+
+
+@pytest.fixture
+def autopush_uploads(monkeypatch):
+    """Record how the autopush hook signs, without pushing."""
+    import spack.hooks.autopush
+
+    keys = []
+
+    class Uploader:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def push_or_raise(self, specs, config):
+            pass
+
+    def make_uploader(mirror, force=False, signing_key=None, **kwargs):
+        keys.append(signing_key)
+        return Uploader()
+
+    monkeypatch.setattr(spack.binary_distribution, "make_uploader", make_uploader)
+    monkeypatch.setattr(
+        spack.mirrors.mirror.Mirror, "matches_binary", lambda self, spec, direction: True
+    )
+    return spack.hooks.autopush.post_install, keys
+
+
+def _autopush_oci_mirror(mutable_config, signed):
+    mutable_config.set(
+        "mirrors:oci",
+        {"url": "oci://example.com/image", "autopush": True, "signed": signed},
+        scope="user",
+    )
+
+
+def test_autopush_signs_oci_images_with_the_cosign_key(mutable_config, autopush_uploads):
+    post_install, keys = autopush_uploads
+    _autopush_oci_mirror(mutable_config, {"method": "cosign", "key": "ci.key"})
+    post_install(_FakeSpec(), True)
+    assert keys == ["ci.key"]
+
+
+def test_autopush_does_not_push_unsigned_to_a_keyless_oci_mirror(mutable_config, autopush_uploads):
+    post_install, keys = autopush_uploads
+    _autopush_oci_mirror(
+        mutable_config,
+        {"method": "cosign", "identity": "https://x/y", "issuer": "https://token.example.com"},
+    )
+    with pytest.raises(spack.error.SpackError, match="keyless signing"):
+        post_install(_FakeSpec(), True)
+    assert keys == []

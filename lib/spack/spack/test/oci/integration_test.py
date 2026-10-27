@@ -22,6 +22,7 @@ import spack.database
 import spack.deptypes as dt
 import spack.environment as ev
 import spack.error
+import spack.mirrors.mirror
 import spack.oci.opener
 import spack.spec
 import spack.traverse
@@ -587,3 +588,107 @@ def test_buildcache_install_rejects_manifest_changed_after_signing(mutable_datab
         with pytest.raises(RuntimeError, match="download of binary cache file"):
             buildcache("install", "mpich")
         assert not mutable_database.installed(spec)
+
+
+_ISSUER = "https://token.actions.githubusercontent.com"
+_IDENTITY = "https://github.com/org/repo/.github/workflows/ci.yml@refs/heads/main"
+
+
+def _keyless_mirror(name: str = "oci-test", **signed):
+    spack.config.CONFIG.set(
+        f"mirrors:{name}",
+        {"url": "oci://example.com/image", "signed": {"method": "cosign", **signed}},
+        scope="user",
+    )
+
+
+class _KeylessCosign(_RecordingCosign):
+    """Accepts a signature only if the verification asks for the identity that signed."""
+
+    def __init__(self, signer: str = _IDENTITY):
+        super().__init__()
+        self.signer = signer
+        self.verify_calls = []
+
+    def __call__(self, *args, **kwargs):
+        if args[0] == "version":
+            return "GitVersion:    v3.1.4\n"
+        if args[0] == "sign":
+            self.signed.append(args[-1])
+        elif args[0] == "verify":
+            self.verify_calls.append(args)
+            asked = args[args.index("--certificate-identity") + 1]
+            if asked != self.signer:
+                raise spack.util.executable.ProcessError("no matching signatures")
+
+
+def _push_with_key_then_uninstall(mutable_database):
+    """Push signed with a key, so the registry has something to install, and uninstall it."""
+    spack.config.CONFIG.set(
+        "mirrors:oci-test",
+        {"url": "oci://example.com/image", "signed": {"method": "cosign", "key": "cosign.key"}},
+        scope="user",
+    )
+    buildcache("push", "--update-index", "oci-test", "mpich")
+    spec = mutable_database.query_local("mpich")[0]
+    spec.package.do_uninstall(force=True)
+    return spec
+
+
+def test_buildcache_install_keyless_checks_the_identity(mutable_database, monkeypatch):
+    cosign = _KeylessCosign()
+    monkeypatch.setattr(spack.util.cosign, "_COSIGN", cosign)
+    monkeypatch.setattr(spack.util.cosign, "_COSIGN_MAJOR", None)
+    with oci_servers(InMemoryOCIRegistry("example.com")):
+        spec = _push_with_key_then_uninstall(mutable_database)
+        _keyless_mirror(identity=_IDENTITY, issuer=_ISSUER)
+        buildcache("install", "mpich")
+
+    assert mutable_database.installed(spec)
+    (call,) = cosign.verify_calls
+    assert call[call.index("--certificate-oidc-issuer") + 1] == _ISSUER
+    assert "--key" not in call and "--insecure-ignore-tlog" not in call
+
+
+def test_buildcache_install_keyless_rejects_another_signer(mutable_database, monkeypatch):
+    monkeypatch.setattr(
+        spack.util.cosign, "_COSIGN", _KeylessCosign(signer="https://github.com/evil/repo")
+    )
+    monkeypatch.setattr(spack.util.cosign, "_COSIGN_MAJOR", None)
+    with oci_servers(InMemoryOCIRegistry("example.com")):
+        spec = _push_with_key_then_uninstall(mutable_database)
+        _keyless_mirror(identity=_IDENTITY, issuer=_ISSUER)
+        with pytest.raises(RuntimeError, match="download of binary cache file"):
+            buildcache("install", "mpich")
+
+    assert not mutable_database.installed(spec)
+
+
+def test_install_without_a_pinned_signer_is_refused(recording_cosign):
+    """A mirror that requires signatures but does not say whose must never accept any signature.
+    The schema rejects such a config, so this is a safety net for mirrors built in code."""
+    mirror_obj = spack.mirrors.mirror.Mirror(
+        {"url": "oci://example.com/image", "signed": {"method": "cosign"}}, name="oci-test"
+    )
+    with pytest.raises(spack.util.cosign.CosignError, match="not configured with a key"):
+        spack.binary_distribution._oci_verify_signature(
+            mirror_obj,
+            "example.com/image@sha256:" + "a" * 64,
+            ImageReference.from_string("example.com/image"),
+        )
+    assert not recording_cosign.verified
+
+
+def test_buildcache_push_to_keyless_mirror_fails_instead_of_pushing_unsigned(
+    mutable_database, recording_cosign
+):
+    """Keyless signing is only supported for installing. Pushing must not silently produce
+    unsigned images to a mirror that requires signatures."""
+    registry = InMemoryOCIRegistry("example.com")
+    with oci_servers(registry):
+        _keyless_mirror(identity=_IDENTITY, issuer=_ISSUER)
+        with pytest.raises(spack.error.SpackError, match="keyless signing"):
+            buildcache("push", "oci-test", "mpich")
+
+    assert not recording_cosign.signed
+    assert not registry.manifests  # nothing was pushed

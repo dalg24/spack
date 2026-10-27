@@ -176,3 +176,69 @@ def verify_image(ref: str, key: str, insecure_registry: bool = False) -> None:
 def _require_digest(ref: str) -> None:
     if "@sha256:" not in ref:
         raise CosignError(f"cosign operations require a digest reference, got '{ref}'")
+
+
+def _anchored(regexp: str) -> str:
+    """Make cosign match the whole identity. It otherwise matches anywhere in it, so that
+    ``github.com/org/repo`` also matches ``github.com/org/repo-evil``."""
+    if regexp in ("", ".*", ".+", "^.*$", "^.+$", "^.*", ".*$"):
+        raise CosignError(f"the identity pattern '{regexp}' matches every signer")
+    return f"^(?:{regexp.removeprefix('^').removesuffix('$')})$"
+
+
+def verify_image_keyless(
+    ref: str,
+    *,
+    issuer: str,
+    identity: Optional[str] = None,
+    identity_regexp: Optional[str] = None,
+    trusted_root: Optional[str] = None,
+    insecure_registry: bool = False,
+) -> None:
+    """Verify that an image was signed by a given identity, with a certificate that Sigstore
+    issued to it.
+
+    Unlike verifying with a key, this needs a trusted record of *when* the image was signed,
+    since such certificates are only valid for minutes. Cosign gets it from the Sigstore
+    transparency log, which needs access to the network, and it cannot be skipped.
+
+    Args:
+        ref: image reference *by digest*
+        issuer: the OIDC issuer that vouched for the identity
+        identity: the exact identity that signed, such as the URL of a CI workflow
+        identity_regexp: a regular expression that must match the whole identity, instead of
+            ``identity``
+        trusted_root: a Sigstore trusted root file, for private Sigstore deployments
+
+    Raises:
+        CosignError: if there is no signature, or it was not made by this identity
+    """
+    _require_digest(ref)
+    if bool(identity) == bool(identity_regexp):
+        raise CosignError("specify exactly one of an identity and an identity pattern")
+    if not issuer:
+        raise CosignError("the OIDC issuer of the signer is required to verify its identity")
+    _check_version()
+
+    identity_args = (
+        ["--certificate-identity", identity]
+        if identity
+        else ["--certificate-identity-regexp", _anchored(identity_regexp or "")]
+    )
+    root_args = ["--trusted-root", trusted_root] if trusted_root else []
+    try:
+        _cosign()(
+            "verify",
+            *identity_args,
+            "--certificate-oidc-issuer",
+            issuer,
+            *root_args,
+            *_registry_args(insecure_registry),
+            ref,
+            output=str,
+            error=str,
+        )
+    except spack.util.executable.ProcessError as e:
+        raise CosignError(
+            f"cosign could not verify that {ref} was signed by the expected identity: {e}"
+        ) from e

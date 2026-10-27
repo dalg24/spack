@@ -531,12 +531,7 @@ def push_fn(args):
     # build caches with GPG.
     signing_key: Optional[str] = None
     if not unsigned and spack.oci.image.is_oci_url(mirror.push_url):
-        signing_key = args.key or mirror.cosign_key
-        if not signing_key:
-            raise spack.error.SpackError(
-                "Signing OCI images requires a cosign key. Set `signed: {method: cosign, key: "
-                "...}` on the mirror, or pass --key."
-            )
+        signing_key = spack.binary_distribution.oci_signing_key(mirror, args.key)
     elif not unsigned:
         signing_key = args.key or spack.binary_distribution.select_signing_key()
 

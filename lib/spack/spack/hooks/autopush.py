@@ -32,7 +32,7 @@ def post_install(spec, explicit):
         signing_key = None
         if mirror.signed:
             if spack.oci.image.is_oci_url(mirror.push_url):
-                signing_key = mirror.cosign_key
+                signing_key = spack.binary_distribution.oci_signing_key(mirror)
             else:
                 signing_key = spack.binary_distribution.select_signing_key()
         with spack.binary_distribution.make_uploader(

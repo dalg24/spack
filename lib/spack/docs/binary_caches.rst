@@ -496,13 +496,14 @@ Keys that are not files, such as KMS URIs, do not need a password.
 You can also pass a key to a single push with ``spack buildcache push --key <key> <mirror> <specs...>``.
 
 When pushing, Spack signs the digest of the manifest of each image it uploads, and the push fails if signing fails.
-The signature is stored in the same repository, as an additional tag of the form ``sha256-<digest>.sig``, which is how cosign signs images.
+The signature is stored in the same repository, next to the image, as a Sigstore bundle that references it.
+Registries that do not support the OCI referrers API show it as an extra tag named ``sha256-<digest>``.
 When installing, Spack verifies the signature of the manifest it received from the registry before using it, and never installs a binary whose signature is missing or invalid.
 Spack does not fall back to unsigned binaries from another mirror for a mirror configured with a cosign key, although it may install the binary from another mirror that provides it.
 Verification can be skipped for a single command with ``spack buildcache install --unsigned``.
 
 Signing and verification only use the key, and do not contact any Sigstore service or transparency log, so they work on machines without access to the internet.
-Keyless signing, with certificates from Fulcio, is not supported.
+For signatures made without a key, see :ref:`below <oci-keyless>`.
 
 .. note::
 
@@ -516,6 +517,43 @@ Keyless signing, with certificates from Fulcio, is not supported.
      Share the public key some other way.
 
    An OCI mirror without a cosign key is not signed or verified, as before.
+
+.. _oci-keyless:
+
+Trusting an Identity Instead of a Key
+"""""""""""""""""""""""""""""""""""""
+
+.. warning::
+
+   Verifying keyless signatures is experimental: it has not been tested against a real Sigstore instance, since that needs a CI job with an identity token.
+   Spack can not yet *create* keyless signatures.
+
+Instead of a key, a mirror can say who produced the images, for example a CI workflow.
+Images signed by that workflow with Sigstore's keyless flow are then trusted, without a key to distribute and protect:
+
+.. code-block:: yaml
+
+    mirrors:
+      my_registry:
+        url: oci://example.com/my_image
+        signed:
+          method: cosign
+          identity: https://github.com/org/repo/.github/workflows/ci.yml@refs/heads/main
+          issuer: https://token.actions.githubusercontent.com
+
+Both are required: ``identity`` is who signed, and ``issuer`` is the OIDC provider that vouched for it.
+A signature made by someone else, or vouched for by another provider, is not accepted.
+Use ``identity_regexp`` instead of ``identity`` to accept several identities, such as the workflows of one repository.
+The expression has to match the whole identity, and one that matches everyone is refused.
+The identity is a security setting: keep it as narrow as possible, since anyone who can sign as a matching identity can publish binaries you will install.
+
+Such certificates are only valid for minutes, so cosign checks that the signature was made in that time against a record in the Sigstore transparency log.
+Verifying therefore needs access to the network, and cannot be done offline as it can with a key.
+For a private Sigstore deployment, set ``trusted_root`` to the path of its trusted root file.
+
+Pushing to a mirror that is configured this way fails, instead of pushing images that clients would refuse.
+Images signed with a key cannot be verified with an identity, or the other way around: the mirror has to be configured for the way its images were signed.
+Until Spack can create keyless signatures itself, only images signed with ``cosign sign`` in a CI job can be installed this way.
 
 .. _oci-authentication:
 

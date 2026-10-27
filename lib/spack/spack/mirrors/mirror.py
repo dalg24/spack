@@ -142,21 +142,40 @@ class Mirror:
     def source(self) -> bool:
         return isinstance(self._data, str) or self._data.get("source", True)
 
-    @property
-    def cosign_key(self) -> Optional[str]:
-        """Key used to sign and verify with cosign, or None if cosign is not configured."""
+    def _cosign_config(self) -> Optional[Dict[str, Any]]:
         if isinstance(self._data, str):
             return None
         signed = self._data.get("signed")
         if isinstance(signed, dict) and signed.get("method") == "cosign":
-            return signed["key"]
+            return signed
         return None
+
+    @property
+    def cosign_key(self) -> Optional[str]:
+        """Key used to sign and verify with cosign, or None if cosign is not configured with a
+        key."""
+        config = self._cosign_config()
+        return config.get("key") if config else None
+
+    @property
+    def cosign_identity(self) -> Optional[Dict[str, str]]:
+        """Who must have signed images for keyless verification with cosign, with the keys
+        ``issuer``, one of ``identity`` and ``identity_regexp``, and optionally
+        ``trusted_root``. None if cosign is not configured for keyless signing."""
+        config = self._cosign_config()
+        if not config or "key" in config:
+            return None
+        return {
+            k: config[k]
+            for k in ("identity", "identity_regexp", "issuer", "trusted_root")
+            if k in config
+        }
 
     @property
     def signed(self) -> bool:
         if is_oci_url(self.fetch_url):
             # OCI images are signed with cosign, and only if that is configured
-            return self.cosign_key is not None
+            return self._cosign_config() is not None
 
         if isinstance(self._data, str):
             return True

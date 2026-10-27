@@ -787,3 +787,23 @@ def test_push_to_other_build_cache_keeps_using_gpg(
 ):
     ci.push_to_build_cache(spack.spec.Spec(), "https://example.com/cache", sign_binaries)
     assert recorded_uploaders == [expected]
+
+
+_KEYLESS = {
+    "method": "cosign",
+    "identity": "https://github.com/org/repo/.github/workflows/ci.yml@refs/heads/main",
+    "issuer": "https://token.actions.githubusercontent.com",
+}
+
+
+def test_push_to_keyless_oci_build_cache_fails_instead_of_pushing_unsigned(
+    mutable_config, recorded_uploaders, capfd
+):
+    """Keyless signing is only supported for installing, and pushing unsigned images to a
+    mirror that requires signatures would defeat it. The job must fail, like any failed push."""
+    mutable_config.set(
+        "mirrors:ci", {"url": "oci://example.com/image", "signed": _KEYLESS}, scope="user"
+    )
+    assert ci.push_to_build_cache(spack.spec.Spec(), "oci://example.com/image", True) is False
+    assert recorded_uploaders == []  # nothing was pushed, signed or not
+    assert "keyless signing" in capfd.readouterr().err

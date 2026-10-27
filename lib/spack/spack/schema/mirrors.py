@@ -116,7 +116,7 @@ mirror_entry = {
                 {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["method", "key"],
+                    "required": ["method"],
                     "properties": {
                         "method": {
                             "type": "string",
@@ -128,7 +128,40 @@ mirror_entry = {
                             "description": "Cosign key: path to a private key (used when "
                             "pushing) or public key (used when installing), or a KMS URI",
                         },
+                        "identity": {
+                            "type": "string",
+                            "description": "Keyless signing: the identity, such as the URL of "
+                            "a CI workflow, that must have signed the images. Requires issuer",
+                        },
+                        "identity_regexp": {
+                            "type": "string",
+                            "description": "Keyless signing: a regular expression that the "
+                            "whole identity must match, as an alternative to identity. "
+                            "Requires issuer",
+                        },
+                        "issuer": {
+                            "type": "string",
+                            "description": "Keyless signing: the OIDC issuer that vouches for "
+                            "the identity, such as https://token.actions.githubusercontent.com",
+                        },
+                        "trusted_root": {
+                            "type": "string",
+                            "description": "Keyless signing: path to a Sigstore trusted root "
+                            "file, for private Sigstore deployments. Defaults to the public "
+                            "Sigstore instance",
+                        },
                     },
+                    "oneOf": [
+                        {"required": ["key"], "not": {"required": ["trusted_root"]}},
+                        {
+                            "required": ["issuer", "identity"],
+                            "not": {"required": ["identity_regexp", "key"]},
+                        },
+                        {
+                            "required": ["issuer", "identity_regexp"],
+                            "not": {"required": ["identity", "key"]},
+                        },
+                    ],
                 },
             ],
         },

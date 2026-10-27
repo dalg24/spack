@@ -190,3 +190,99 @@ def test_keys_that_are_not_files_are_not_asked_for(fake_cosign, monkeypatch, key
     cosign.prepare_signing_key(key)
     cosign.sign_image(f"example.com/img@{DIGEST}", key)
     assert not prompts and len(fake_cosign.calls) == 1
+
+
+ISSUER = "https://token.actions.githubusercontent.com"
+IDENTITY = "https://github.com/org/repo/.github/workflows/ci.yml@refs/heads/main"
+
+
+def test_verify_keyless(fake_cosign):
+    cosign.verify_image_keyless(f"example.com/img@{DIGEST}", issuer=ISSUER, identity=IDENTITY)
+    assert fake_cosign.calls == [
+        (
+            "verify",
+            "--certificate-identity",
+            IDENTITY,
+            "--certificate-oidc-issuer",
+            ISSUER,
+            f"example.com/img@{DIGEST}",
+        )
+    ]
+
+
+def test_verify_keyless_never_skips_the_transparency_log(fake_cosign):
+    """The certificates are only valid for minutes, and the log is what proves the signature was
+    made in that time. Skipping it would accept signatures made with long expired certificates."""
+    cosign.verify_image_keyless(f"example.com/img@{DIGEST}", issuer=ISSUER, identity=IDENTITY)
+    cosign.verify_image_keyless(f"example.com/img@{DIGEST}", issuer=ISSUER, identity_regexp="a")
+    assert not any("--insecure-ignore-tlog" in call for call in fake_cosign.calls)
+    assert not any("--key" in call for call in fake_cosign.calls)
+
+
+def test_verify_keyless_trusted_root(fake_cosign):
+    cosign.verify_image_keyless(
+        f"example.com/img@{DIGEST}", issuer=ISSUER, identity=IDENTITY, trusted_root="root.json"
+    )
+    args = fake_cosign.calls[0]
+    assert args[args.index("--trusted-root") + 1] == "root.json"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"issuer": ISSUER},  # who?
+        {"issuer": ISSUER, "identity": IDENTITY, "identity_regexp": "x"},  # which one?
+        {"issuer": "", "identity": IDENTITY},  # vouched for by whom?
+    ],
+)
+def test_verify_keyless_requires_the_signer_to_be_pinned(fake_cosign, kwargs):
+    with pytest.raises(cosign.CosignError):
+        cosign.verify_image_keyless(f"example.com/img@{DIGEST}", **kwargs)
+    assert not fake_cosign.calls
+
+
+def test_verify_keyless_tag_is_refused(fake_cosign):
+    with pytest.raises(cosign.CosignError, match="digest reference"):
+        cosign.verify_image_keyless("example.com/img:latest", issuer=ISSUER, identity=IDENTITY)
+
+
+@pytest.mark.parametrize(
+    "pattern,matches,does_not_match",
+    [
+        (
+            "https://github.com/org/repo",
+            "https://github.com/org/repo",
+            "https://github.com/org/repo-evil",
+        ),
+        (
+            "https://github.com/org/repo/.*",
+            "https://github.com/org/repo/x",
+            "https://github.com/org/repo-evil/x",
+        ),
+        (
+            "^https://github.com/org/(a|b)$",
+            "https://github.com/org/b",
+            "https://github.com/org/bc",
+        ),
+        ("a|b", "b", "xb"),
+    ],
+)
+def test_identity_pattern_must_match_the_whole_identity(pattern, matches, does_not_match):
+    import re
+
+    anchored = cosign._anchored(pattern)
+    assert re.search(anchored, matches)
+    assert not re.search(anchored, does_not_match)
+
+
+@pytest.mark.parametrize("pattern", ["", ".*", ".+", "^.*$", ".*$"])
+def test_identity_pattern_matching_everyone_is_refused(pattern):
+    with pytest.raises(cosign.CosignError, match="matches every signer"):
+        cosign._anchored(pattern)
+
+
+def test_old_cosign_cannot_verify_keyless(monkeypatch):
+    fake = _install(monkeypatch, FakeCosign(major=2))
+    with pytest.raises(cosign.CosignError, match="not supported"):
+        cosign.verify_image_keyless(f"example.com/img@{DIGEST}", issuer=ISSUER, identity=IDENTITY)
+    assert not fake.calls
