@@ -144,13 +144,28 @@ def _extra_env(*envs: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
     return merged or None
 
 
-def _run_on_image(ref: str, *args: str, env: Optional[Dict[str, str]] = None) -> None:
+def _run_on_image(
+    ref: str, *args: str, env: Optional[Dict[str, str]] = None, own_tuf_cache: bool = False
+) -> None:
     """Run cosign on an image, logged in to its registry with the credentials of the mirror.
 
     Every use of cosign that talks to the registry goes through here, so that none can forget
-    the login. Raises ProcessError, like the executable."""
-    with _registry_login(ref) as login:
-        _cosign()(*args, output=str, error=str, extra_env=_extra_env(login, env))
+    the login. Raises ProcessError, like the executable.
+
+    Args:
+        own_tuf_cache: give this run its own cache of the Sigstore trust metadata. Cosign
+            refreshes the shared cache in ``~/.sigstore`` every time it runs, and images are
+            signed from several threads: on a machine where it is empty, concurrent runs
+            failed to write it ("failed to persist metadata"). Only needed when cosign uses
+            Sigstore, and not when it is given a key.
+    """
+    with contextlib.ExitStack() as stack:
+        login = stack.enter_context(_registry_login(ref))
+        tuf_env = None
+        if own_tuf_cache:
+            tuf_root = stack.enter_context(tempfile.TemporaryDirectory(prefix="spack-tuf-"))
+            tuf_env = {"TUF_ROOT": tuf_root}
+        _cosign()(*args, output=str, error=str, extra_env=_extra_env(login, tuf_env, env))
 
 
 def _registry_args(insecure_registry: bool) -> List[str]:
@@ -283,6 +298,7 @@ def verify_image_keyless(
             *root_args,
             *_registry_args(insecure_registry),
             ref,
+            own_tuf_cache=True,
         )
     except spack.util.executable.ProcessError as e:
         raise CosignError(
@@ -316,6 +332,7 @@ def sign_image_keyless(ref: str, insecure_registry: bool = False) -> None:
             "--fulcio-auth-flow=token",
             *_registry_args(insecure_registry),
             ref,
+            own_tuf_cache=True,
         )
     except spack.util.executable.ProcessError as e:
         raise CosignError(

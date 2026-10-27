@@ -458,3 +458,52 @@ def test_no_login_without_credentials_for_the_registry(fake_cosign, registry_log
     seen = _record_login(fake_cosign)
     cosign.sign_image(f"other.example.org/img@{DIGEST}", "key")
     assert seen == [None]
+
+
+def _record_tuf_root(fake_cosign):
+    seen = []
+
+    def record(*args, **kwargs):
+        env = kwargs.get("extra_env") or {}
+        root = env.get("TUF_ROOT")
+        seen.append(None if root is None else {"root": root, "writable": os.access(root, os.W_OK)})
+
+    fake_cosign.on_call = record
+    return seen
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: cosign.sign_image_keyless(f"example.com/img@{DIGEST}"),
+        lambda: cosign.verify_image_keyless(
+            f"example.com/img@{DIGEST}", issuer=ISSUER, identity=IDENTITY
+        ),
+    ],
+    ids=["sign-keyless", "verify-keyless"],
+)
+def test_keyless_runs_have_their_own_sigstore_cache(fake_cosign, call):
+    """Images are signed from several threads, and cosign rewrites its shared cache of the
+    Sigstore trust metadata every time it runs."""
+    seen = _record_tuf_root(fake_cosign)
+    call()
+    call()
+    first, second = seen
+    assert first["writable"] and second["writable"]
+    assert first["root"] != second["root"]
+    assert not os.path.exists(first["root"]) and not os.path.exists(second["root"])
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: cosign.sign_image(f"example.com/img@{DIGEST}", "key"),
+        lambda: cosign.verify_image(f"example.com/img@{DIGEST}", "key"),
+    ],
+    ids=["sign-key", "verify-key"],
+)
+def test_runs_with_a_key_do_not_use_sigstore_at_all(fake_cosign, monkeypatch, call):
+    monkeypatch.setenv("COSIGN_PASSWORD", "")
+    seen = _record_tuf_root(fake_cosign)
+    call()
+    assert seen == [None]
