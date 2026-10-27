@@ -353,3 +353,108 @@ def test_keyless_signer_does_not_verify_when_signing_failed(monkeypatch):
 def test_keyless_signer_needs_exactly_one_identity(kwargs):
     with pytest.raises(cosign.CosignError):
         cosign.KeylessSigner(issuer=ISSUER, **kwargs)
+
+
+@pytest.fixture
+def registry_login(monkeypatch):
+    """Make a mirror provide credentials for the registry example.com."""
+    import spack.oci.opener
+
+    monkeypatch.setattr(
+        spack.oci.opener,
+        "credentials_from_mirrors",
+        lambda domain, **kwargs: (
+            spack.oci.opener.UsernamePassword("alice", "s3cret")
+            if domain == "example.com"
+            else None
+        ),
+    )
+
+
+def _record_login(fake_cosign):
+    """Record what cosign sees of the login when it runs, since the file is deleted afterwards."""
+    seen = []
+
+    def record(*args, **kwargs):
+        env = kwargs.get("extra_env") or {}
+        if "DOCKER_CONFIG" not in env:
+            seen.append(None)
+            return
+        directory = env["DOCKER_CONFIG"]
+        path = os.path.join(directory, "config.json")
+        with open(path, encoding="utf-8") as f:
+            content = json.load(f)
+        seen.append(
+            {
+                "content": content,
+                "file_mode": os.stat(path).st_mode & 0o777,
+                "dir_mode": os.stat(directory).st_mode & 0o777,
+                "directory": directory,
+                "argv": args,
+            }
+        )
+
+    fake_cosign.on_call = record
+    return seen
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: cosign.sign_image(f"example.com/img@{DIGEST}", "key"),
+        lambda: cosign.verify_image(f"example.com/img@{DIGEST}", "key"),
+        lambda: cosign.sign_image_keyless(f"example.com/img@{DIGEST}"),
+        lambda: cosign.verify_image_keyless(
+            f"example.com/img@{DIGEST}", issuer=ISSUER, identity=IDENTITY
+        ),
+    ],
+    ids=["sign", "verify", "sign-keyless", "verify-keyless"],
+)
+def test_every_use_of_cosign_is_logged_in_to_the_registry(
+    fake_cosign, registry_login, monkeypatch, call
+):
+    """Cosign has no option for credentials other than a Docker config, and it would otherwise be
+    refused by registries that need a login."""
+    monkeypatch.setenv("COSIGN_PASSWORD", "")
+    seen = _record_login(fake_cosign)
+    call()
+    (login,) = seen
+    assert login is not None, "cosign ran without the credentials of the registry"
+
+    import base64
+
+    auth = login["content"]["auths"]["example.com"]["auth"]
+    assert base64.b64decode(auth) == b"alice:s3cret"
+
+
+def test_login_is_private_and_removed(fake_cosign, registry_login, monkeypatch):
+    monkeypatch.setenv("COSIGN_PASSWORD", "")
+    seen = _record_login(fake_cosign)
+    cosign.sign_image(f"example.com/img@{DIGEST}", "key")
+    (login,) = seen
+    assert login["file_mode"] == 0o600 and login["dir_mode"] == 0o700
+    assert not os.path.exists(login["directory"])
+
+
+def test_login_is_removed_when_cosign_fails(monkeypatch, registry_login):
+    fake = _install(monkeypatch, FakeCosign(fail=True))
+    monkeypatch.setenv("COSIGN_PASSWORD", "")
+    seen = _record_login(fake)
+    with pytest.raises(cosign.CosignError):
+        cosign.verify_image(f"example.com/img@{DIGEST}", "key")
+    assert not os.path.exists(seen[0]["directory"])
+
+
+def test_credentials_are_not_on_the_command_line(fake_cosign, registry_login, monkeypatch):
+    """The process list, and the command echoed by errors, would show them."""
+    monkeypatch.setenv("COSIGN_PASSWORD", "")
+    seen = _record_login(fake_cosign)
+    cosign.sign_image(f"example.com/img@{DIGEST}", "key")
+    assert "s3cret" not in " ".join(seen[0]["argv"])
+
+
+def test_no_login_without_credentials_for_the_registry(fake_cosign, registry_login, monkeypatch):
+    monkeypatch.setenv("COSIGN_PASSWORD", "")
+    seen = _record_login(fake_cosign)
+    cosign.sign_image(f"other.example.org/img@{DIGEST}", "key")
+    assert seen == [None]

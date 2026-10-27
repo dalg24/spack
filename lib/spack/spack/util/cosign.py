@@ -5,13 +5,15 @@
 key. Neither signing nor verification contacts any Sigstore service, so this works on machines
 without access to the public internet. Cosign 3 or newer is required."""
 
+import base64
+import contextlib
 import getpass
 import json
 import os
 import re
 import sys
 import tempfile
-from typing import List, Optional
+from typing import Dict, Iterator, List, Optional
 
 import spack.error
 import spack.util.executable
@@ -104,6 +106,53 @@ _NO_PASSWORD_MESSAGE = (
 )
 
 
+@contextlib.contextmanager
+def _registry_login(ref: str) -> Iterator[Optional[Dict[str, str]]]:
+    """Give cosign the credentials of the mirror for the registry of an image.
+
+    Cosign only reads credentials from a Docker config file, and has no environment variable
+    for them. Passing them as options would show them in the process list and in error messages.
+    They are written to a private file that exists only while cosign runs, and cosign is
+    pointed to it with ``DOCKER_CONFIG``.
+
+    Yields:
+        the environment variables to run cosign with, or None if no mirror has credentials for
+        the registry
+    """
+    import spack.oci.opener
+
+    domain = ref.split("/", 1)[0]
+    credentials = spack.oci.opener.credentials_from_mirrors(domain)
+    if not credentials:
+        yield None
+        return
+
+    with tempfile.TemporaryDirectory(prefix="spack-cosign-") as directory:
+        # TemporaryDirectory creates it with permissions for the user only
+        path = os.path.join(directory, "config.json")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        auth = base64.b64encode(f"{credentials.username}:{credentials.password}".encode())
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"auths": {domain: {"auth": auth.decode()}}}, f)
+        yield {"DOCKER_CONFIG": directory}
+
+
+def _extra_env(*envs: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    merged: Dict[str, str] = {}
+    for env in envs:
+        merged.update(env or {})
+    return merged or None
+
+
+def _run_on_image(ref: str, *args: str, env: Optional[Dict[str, str]] = None) -> None:
+    """Run cosign on an image, logged in to its registry with the credentials of the mirror.
+
+    Every use of cosign that talks to the registry goes through here, so that none can forget
+    the login. Raises ProcessError, like the executable."""
+    with _registry_login(ref) as login:
+        _cosign()(*args, output=str, error=str, extra_env=_extra_env(login, env))
+
+
 def _registry_args(insecure_registry: bool) -> List[str]:
     return ["--allow-http-registry"] if insecure_registry else []
 
@@ -129,7 +178,8 @@ def sign_image(ref: str, key: str, insecure_registry: bool = False) -> None:
         with open(config, "w", encoding="utf-8") as f:
             json.dump(_OFFLINE_SIGNING_CONFIG, f)
         try:
-            _cosign()(
+            _run_on_image(
+                ref,
                 "sign",
                 "--key",
                 key,
@@ -138,9 +188,7 @@ def sign_image(ref: str, key: str, insecure_registry: bool = False) -> None:
                 config,
                 *_registry_args(insecure_registry),
                 ref,
-                output=str,
-                error=str,
-                extra_env=(
+                env=(
                     {"COSIGN_PASSWORD": _PASSWORD}
                     if _PASSWORD is not None and "COSIGN_PASSWORD" not in os.environ
                     else None
@@ -159,15 +207,14 @@ def verify_image(ref: str, key: str, insecure_registry: bool = False) -> None:
     _require_digest(ref)
     _check_version()
     try:
-        _cosign()(
+        _run_on_image(
+            ref,
             "verify",
             "--key",
             key,
             "--insecure-ignore-tlog",
             *_registry_args(insecure_registry),
             ref,
-            output=str,
-            error=str,
         )
     except spack.util.executable.ProcessError as e:
         raise CosignError(f"cosign could not verify {ref}: {e}") from e
@@ -227,7 +274,8 @@ def verify_image_keyless(
     )
     root_args = ["--trusted-root", trusted_root] if trusted_root else []
     try:
-        _cosign()(
+        _run_on_image(
+            ref,
             "verify",
             *identity_args,
             "--certificate-oidc-issuer",
@@ -235,8 +283,6 @@ def verify_image_keyless(
             *root_args,
             *_registry_args(insecure_registry),
             ref,
-            output=str,
-            error=str,
         )
     except spack.util.executable.ProcessError as e:
         raise CosignError(
@@ -261,7 +307,8 @@ def sign_image_keyless(ref: str, insecure_registry: bool = False) -> None:
     _require_digest(ref)
     _check_version()
     try:
-        _cosign()(
+        _run_on_image(
+            ref,
             "sign",
             "--yes",
             # Only use a token from the environment of the job. Cosign would otherwise fall back
@@ -269,8 +316,6 @@ def sign_image_keyless(ref: str, insecure_registry: bool = False) -> None:
             "--fulcio-auth-flow=token",
             *_registry_args(insecure_registry),
             ref,
-            output=str,
-            error=str,
         )
     except spack.util.executable.ProcessError as e:
         raise CosignError(
