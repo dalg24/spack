@@ -275,10 +275,58 @@ def test_identity_pattern_must_match_the_whole_identity(pattern, matches, does_n
     assert not re.search(anchored, does_not_match)
 
 
-@pytest.mark.parametrize("pattern", ["", ".*", ".+", "^.*$", ".*$"])
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "",
+        ".*",
+        ".+",
+        "^.*$",
+        ".*$",
+        "(.*)",
+        ".*?",
+        "^.*?$",
+        r"[\s\S]*",
+        ".{0,}",
+        "a|.*",
+        "(a|.*)",
+        "^$|.*",
+        ".*@.*",  # any address at any domain
+    ],
+)
 def test_identity_pattern_matching_everyone_is_refused(pattern):
     with pytest.raises(cosign.CosignError, match="matches every signer"):
         cosign._anchored(pattern)
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        r"https://github.com/org/repo/.github/workflows/ci.yml@.*",
+        r"https://github.com/org/(a|b)/.*",
+        r".*@example.com",
+        r"^https://github.com/org/repo$",
+        r"https://github.com/org/repo/\$",
+    ],
+)
+def test_identity_patterns_that_name_someone_are_accepted(pattern):
+    import re
+
+    assert re.compile(cosign._anchored(pattern))
+
+
+def test_escaped_dollar_is_kept():
+    """A literal dollar at the end of a pattern is part of the identity, not an anchor."""
+    import re
+
+    anchored = cosign._anchored(r"https://github.com/org/repo/\$")
+    assert re.search(anchored, "https://github.com/org/repo/$")
+    assert not re.search(anchored, "https://github.com/org/repo/")
+
+
+def test_invalid_identity_pattern_is_refused():
+    with pytest.raises(cosign.CosignError, match="not a valid pattern"):
+        cosign._anchored("https://github.com/(org")
 
 
 def test_old_cosign_cannot_verify_keyless(monkeypatch):
@@ -507,3 +555,84 @@ def test_runs_with_a_key_do_not_use_sigstore_at_all(fake_cosign, monkeypatch, ca
     seen = _record_tuf_root(fake_cosign)
     call()
     assert seen == [None]
+
+
+@pytest.fixture
+def no_cosign(monkeypatch):
+    import spack.bootstrap
+
+    monkeypatch.setattr(cosign, "_COSIGN", None)
+    monkeypatch.setattr(cosign, "_COSIGN_MAJOR", None)
+
+    def cannot_bootstrap(*args, **kwargs):
+        raise RuntimeError("no network to build cosign")
+
+    monkeypatch.setattr(spack.bootstrap, "ensure_cosign_in_path_or_raise", cannot_bootstrap)
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: cosign.sign_image(f"example.com/img@{DIGEST}", "/no/such/key"),
+        lambda: cosign.verify_image(f"example.com/img@{DIGEST}", "key"),
+        lambda: cosign.sign_image_keyless(f"example.com/img@{DIGEST}"),
+        lambda: cosign.verify_image_keyless(
+            f"example.com/img@{DIGEST}", issuer=ISSUER, identity=IDENTITY
+        ),
+    ],
+    ids=["sign", "verify", "sign-keyless", "verify-keyless"],
+)
+def test_missing_cosign_is_a_cosign_error(no_cosign, call):
+    """Callers handle CosignError. A bare RuntimeError from a failed bootstrap would abort an
+    install that could have used another mirror."""
+    with pytest.raises(cosign.CosignError, match="no network to build cosign"):
+        call()
+
+
+def test_cosign_is_looked_up_once_from_many_threads(monkeypatch):
+    import concurrent.futures
+    import time
+
+    import spack.bootstrap
+
+    monkeypatch.setattr(cosign, "_COSIGN", None)
+    lookups = []
+
+    def slow_lookup():
+        lookups.append(1)
+        time.sleep(0.05)
+        return FakeCosign()
+
+    monkeypatch.setattr(spack.bootstrap, "ensure_cosign_in_path_or_raise", slow_lookup)
+    with concurrent.futures.ThreadPoolExecutor(8) as pool:
+        list(pool.map(lambda _: cosign._cosign(), range(8)))
+    assert len(lookups) == 1
+
+
+@pytest.fixture
+def public_key_file(tmp_path):
+    path = tmp_path / "cosign.pub"
+    path.write_text("-----BEGIN PUBLIC KEY-----\nMFkw\n-----END PUBLIC KEY-----\n")
+    return str(path)
+
+
+def test_public_key_is_not_asked_a_password_for(fake_cosign, public_key_file, monkeypatch):
+    """The key of a mirror is the public key where images are installed. Asking for a password
+    for it, or letting cosign wait for one, would send the user the wrong way."""
+    monkeypatch.delenv("COSIGN_PASSWORD", raising=False)
+    monkeypatch.setattr(cosign, "_PASSWORD", None)
+    prompts = _terminal(monkeypatch, isatty=True)
+    with pytest.raises(cosign.CosignError, match="is a public key"):
+        cosign.prepare_signing_key(public_key_file)
+    assert not prompts
+
+
+def test_signing_with_a_public_key_is_refused_before_cosign_runs(fake_cosign, public_key_file):
+    with pytest.raises(cosign.CosignError, match="signing needs the private key"):
+        cosign.sign_image(f"example.com/img@{DIGEST}", public_key_file)
+    assert not fake_cosign.calls
+
+
+def test_verifying_with_a_public_key_is_fine(fake_cosign, public_key_file):
+    cosign.verify_image(f"example.com/img@{DIGEST}", public_key_file)
+    assert len(fake_cosign.calls) == 1

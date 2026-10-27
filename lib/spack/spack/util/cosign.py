@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 from typing import Dict, Iterator, List, Optional
 
 import spack.error
@@ -45,14 +46,24 @@ class CosignError(spack.error.SpackError):
     """Raised when cosign fails to sign or verify."""
 
 
+#: Makes sure that only one thread looks for cosign, or bootstraps it
+_COSIGN_LOCK = threading.Lock()
+
+
 def _cosign() -> Executable:
     global _COSIGN
-    if _COSIGN is None:
-        import spack.bootstrap
+    # Images are signed from several threads, and bootstrapping is not safe to do concurrently
+    with _COSIGN_LOCK:
+        if _COSIGN is None:
+            import spack.bootstrap
 
-        with spack.bootstrap.ensure_bootstrap_configuration():
-            _COSIGN = spack.bootstrap.ensure_cosign_in_path_or_raise()
-    return _COSIGN
+            try:
+                with spack.bootstrap.ensure_bootstrap_configuration():
+                    _COSIGN = spack.bootstrap.ensure_cosign_in_path_or_raise()
+            except Exception as e:
+                # Callers handle CosignError, and a bare RuntimeError would abort the install
+                raise CosignError(f"cosign {MIN_COSIGN_MAJOR} or newer is needed: {e}") from e
+        return _COSIGN
 
 
 def _check_version() -> None:
@@ -71,6 +82,22 @@ def _check_version() -> None:
         raise CosignError(
             f"cosign {_COSIGN_MAJOR} is not supported, use cosign {MIN_COSIGN_MAJOR} or newer"
         )
+
+
+def _is_public_key(key: str) -> bool:
+    """Whether the key is a file that holds a public key, which cannot sign."""
+    try:
+        with open(key, encoding="utf-8") as f:
+            return f.readline().startswith("-----BEGIN PUBLIC KEY-----")
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def _public_key_message(key: str) -> str:
+    return (
+        f"{key} is a public key, and signing needs the private key. The key of a mirror is the "
+        "private key where images are pushed from, and the public key where they are installed."
+    )
 
 
 def _needs_password(key: str) -> bool:
@@ -92,6 +119,8 @@ def prepare_signing_key(key: str) -> None:
         CosignError: if the password is needed and cannot be asked for
     """
     global _PASSWORD
+    if _is_public_key(key):
+        raise CosignError(_public_key_message(key))
     if not _needs_password(key):
         return
     if not sys.stdin.isatty():
@@ -183,6 +212,9 @@ def sign_image(ref: str, key: str, insecure_registry: bool = False) -> None:
         insecure_registry: the registry speaks plain http
     """
     _require_digest(ref)
+    if _is_public_key(key):
+        # Cosign would wait for a password for it, which cannot be answered
+        raise CosignError(_public_key_message(key))
     if _needs_password(key):
         # Never let cosign prompt: this may run in a thread, and the prompt would be invisible
         raise CosignError(_NO_PASSWORD_MESSAGE.format(key=key))
@@ -240,12 +272,37 @@ def _require_digest(ref: str) -> None:
         raise CosignError(f"cosign operations require a digest reference, got '{ref}'")
 
 
+#: Strings that no identity worth trusting would match, of different shapes
+_UNRELATED_IDENTITIES = (
+    "x",
+    "",
+    "https://example.invalid/unrelated",
+    "https://evil.example.org/.github/workflows/ci.yml@refs/heads/main",
+    "someone@example.invalid",
+)
+
+
 def _anchored(regexp: str) -> str:
-    """Make cosign match the whole identity. It otherwise matches anywhere in it, so that
-    ``github.com/org/repo`` also matches ``github.com/org/repo-evil``."""
-    if regexp in ("", ".*", ".+", "^.*$", "^.+$", "^.*", ".*$"):
+    """Make cosign match the whole identity, and refuse patterns that match everyone.
+
+    Cosign matches a pattern anywhere in the identity, so ``github.com/org/repo`` would also
+    match ``github.com/org/repo-evil``.
+
+    There are too many ways to write a pattern that matches anything to list them, so test it
+    instead: one that matches strings that have nothing to do with each other does not
+    identify anyone. Python's regular expressions stand in for cosign's here, which agree on
+    the constructs used to write patterns like these.
+    """
+    if regexp.endswith("$") and not regexp.endswith("\\$"):
+        regexp = regexp[:-1]
+    anchored = f"^(?:{regexp.removeprefix('^')})$"
+    try:
+        compiled = re.compile(anchored)
+    except re.error as e:
+        raise CosignError(f"the identity pattern '{regexp}' is not a valid pattern: {e}") from e
+    if any(compiled.search(probe) for probe in _UNRELATED_IDENTITIES):
         raise CosignError(f"the identity pattern '{regexp}' matches every signer")
-    return f"^(?:{regexp.removeprefix('^').removesuffix('$')})$"
+    return anchored
 
 
 def verify_image_keyless(
@@ -360,21 +417,6 @@ class KeylessSigner:
         self.identity = identity
         self.identity_regexp = identity_regexp
         self.trusted_root = trusted_root
-
-    def is_signed(self, ref: str, insecure_registry: bool = False) -> bool:
-        """Whether the image is already signed by the identity that clients expect."""
-        try:
-            verify_image_keyless(
-                ref,
-                issuer=self.issuer,
-                identity=self.identity,
-                identity_regexp=self.identity_regexp,
-                trusted_root=self.trusted_root,
-                insecure_registry=insecure_registry,
-            )
-        except CosignError:
-            return False
-        return True
 
     def sign(self, ref: str, insecure_registry: bool = False) -> None:
         sign_image_keyless(ref, insecure_registry)
