@@ -66,9 +66,20 @@ jobs:
           # Build from source, and not from the mirror: otherwise what is in the registry from an
           # earlier run decides what is installed here, and the push then misses some of it
           spack install --no-cache --fail-fast zlib-ng
+          # The registry can hold other builds of zlib-ng from earlier runs, with other
+          # dependencies and no signatures from this job. Refer to this build only, by its hash.
+          HASH="$(spack find --format '{hash}' zlib-ng)"
+          # `spack find` prints an error and still succeeds when nothing is installed, and
+          # prints one hash per line when several builds are
+          if ! [[ "$HASH" =~ ^[a-z0-9]{32}$ ]]; then
+            echo "::error::expected the hash of one installed zlib-ng, got: $HASH"
+            exit 1
+          fi
+          echo "SPEC=/$HASH" >> "$GITHUB_ENV"
           # Signs with the identity token of this job, and checks the signature against IDENTITY
           set -o pipefail
-          if ! spack buildcache push --update-index test-cache zlib-ng 2>&1 | tee push.log; then
+          SPEC="/$HASH"
+          if ! spack buildcache push --update-index test-cache "$SPEC" 2>&1 | tee push.log; then
             echo "::group::Why signing failed"
             if grep -q "By typing 'y', you attest" push.log; then
               # Cosign prints a long notice before the reason, so show the lines after it
@@ -84,7 +95,8 @@ jobs:
       - name: The images are signed by this workflow, according to cosign itself
         run: |
           . share/spack/setup-env.sh
-          spack python .github/workflows/bin/cosign_pushed_digests.py "$OCI_URL" | tee digests.txt
+          # Only what this job pushed: the registry also holds images from earlier runs
+          spack python .github/workflows/bin/cosign_pushed_digests.py "$OCI_URL" "$SPEC" | tee digests.txt
           test -s digests.txt
           while read -r ref; do
             cosign verify \
@@ -98,8 +110,8 @@ jobs:
         run: |
           . share/spack/setup-env.sh
           spack uninstall -y --all
-          spack buildcache install zlib-ng
-          spack find zlib-ng
+          spack buildcache install "$SPEC"
+          spack find "$SPEC"
 
       - name: Another identity is refused
         run: |
@@ -107,14 +119,14 @@ jobs:
           spack uninstall -y --all
           spack python .github/workflows/bin/cosign_mirror_config.py "$OCI_URL" "$ISSUER" \
               --identity "https://github.com/someone-else/repo/.github/workflows/ci.yml@refs/heads/main"
-          .github/workflows/bin/cosign_expect_refused.sh zlib-ng "installed an image signed by a different identity"
+          .github/workflows/bin/cosign_expect_refused.sh "$SPEC" "installed an image signed by a different identity"
 
       - name: Another issuer is refused
         run: |
           . share/spack/setup-env.sh
           spack python .github/workflows/bin/cosign_mirror_config.py "$OCI_URL" https://gitlab.com \
               --identity "$IDENTITY"
-          .github/workflows/bin/cosign_expect_refused.sh zlib-ng "installed an image vouched for by a different issuer"
+          .github/workflows/bin/cosign_expect_refused.sh "$SPEC" "installed an image vouched for by a different issuer"
 
       - name: A pattern is anchored, so a prefix of this workflow is refused
         run: |
@@ -122,12 +134,12 @@ jobs:
           # Matches the start of the identity only: it must not be accepted
           spack python .github/workflows/bin/cosign_mirror_config.py "$OCI_URL" "$ISSUER" \
               --identity-regexp "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/cosign"
-          .github/workflows/bin/cosign_expect_refused.sh zlib-ng "a pattern matching only a prefix of the identity was accepted"
+          .github/workflows/bin/cosign_expect_refused.sh "$SPEC" "a pattern matching only a prefix of the identity was accepted"
 
       - name: A pattern that matches the whole identity is accepted
         run: |
           . share/spack/setup-env.sh
           spack python .github/workflows/bin/cosign_mirror_config.py "$OCI_URL" "$ISSUER" \
               --identity-regexp "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/cosign-oci-keyless.yaml@.*"
-          spack buildcache install zlib-ng
-          spack find zlib-ng
+          spack buildcache install "$SPEC"
+          spack find "$SPEC"
