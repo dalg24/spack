@@ -344,6 +344,21 @@ class KeylessSigner:
         self.identity_regexp = identity_regexp
         self.trusted_root = trusted_root
 
+    def is_signed(self, ref: str, insecure_registry: bool = False) -> bool:
+        """Whether the image is already signed by the identity that clients expect."""
+        try:
+            verify_image_keyless(
+                ref,
+                issuer=self.issuer,
+                identity=self.identity,
+                identity_regexp=self.identity_regexp,
+                trusted_root=self.trusted_root,
+                insecure_registry=insecure_registry,
+            )
+        except CosignError:
+            return False
+        return True
+
     def sign(self, ref: str, insecure_registry: bool = False) -> None:
         sign_image_keyless(ref, insecure_registry)
         try:

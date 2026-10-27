@@ -734,3 +734,149 @@ def test_buildcache_push_keyless_without_identity_token_fails(mutable_database, 
         _keyless_mirror(identity=_IDENTITY, issuer=_ISSUER)
         with pytest.raises(spack.error.SpackError, match="retrieving ID token: empty input"):
             buildcache("push", "oci-test", "mpich")
+
+
+def _push_unsigned_first(mutable_database, spec_str: str = "mpich"):
+    """Push without signing, as an earlier push did whose signing failed or was not set up."""
+    spack.config.CONFIG.set("mirrors:oci-test", {"url": "oci://example.com/image"}, scope="user")
+    buildcache("push", "oci-test", spec_str)
+
+
+def test_push_signs_images_that_were_pushed_unsigned(mutable_database, recording_cosign):
+    """A push must not skip images that exist but are unsigned, or a mirror that requires
+    signatures keeps images that clients refuse, whatever is pushed after."""
+    registry = InMemoryOCIRegistry("example.com")
+    with oci_servers(registry):
+        _push_unsigned_first(mutable_database)
+        assert not recording_cosign.signed
+
+        spack.config.CONFIG.set(
+            "mirrors:oci-test",
+            {
+                "url": "oci://example.com/image",
+                "signed": {"method": "cosign", "key": "cosign.key"},
+            },
+            scope="user",
+        )
+        buildcache("push", "oci-test", "mpich")
+
+    spec_tags = [tag for (_, tag) in registry.manifests if tag.endswith(".spack")]
+    assert len(recording_cosign.signed) == len(spec_tags) > 1
+    # What is signed is the manifest the registry serves, which is what clients verify
+    expected = {
+        "example.com/image@sha256:"
+        + hashlib.sha256(registry.raw_manifests[("image", tag)]).hexdigest()
+        for tag in spec_tags
+    }
+    assert set(recording_cosign.signed) == expected
+
+
+def test_push_that_cannot_sign_existing_images_fails(mutable_database, monkeypatch):
+    class Failing(_RecordingCosign):
+        def __call__(self, *args, **kwargs):
+            if args[0] == "sign":
+                raise spack.util.executable.ProcessError("denied")
+            return super().__call__(*args, **kwargs)
+
+    monkeypatch.setattr(spack.util.cosign, "_COSIGN", Failing())
+    monkeypatch.setattr(spack.util.cosign, "_COSIGN_MAJOR", None)
+    with oci_servers(InMemoryOCIRegistry("example.com")):
+        _push_unsigned_first(mutable_database)
+        spack.config.CONFIG.set(
+            "mirrors:oci-test",
+            {
+                "url": "oci://example.com/image",
+                "signed": {"method": "cosign", "key": "cosign.key"},
+            },
+            scope="user",
+        )
+        with pytest.raises(spack.error.SpackError, match="denied"):
+            buildcache("push", "oci-test", "mpich")
+
+
+def test_push_unsigned_still_skips_existing_images(mutable_database, recording_cosign):
+    with oci_servers(InMemoryOCIRegistry("example.com")):
+        _push_unsigned_first(mutable_database)
+        out = buildcache("push", "oci-test", "mpich")
+    assert "already in the buildcache" in out
+    assert not recording_cosign.signed
+
+
+class _SignedAs(_KeylessCosign):
+    """Keyless cosign that remembers which digests are signed, as the registry would."""
+
+    def __init__(self, signer):
+        super().__init__(signer=signer)
+        self.already_signed = set()
+
+    def __call__(self, *args, **kwargs):
+        if args[0] == "sign":
+            self.already_signed.add(args[-1])
+            self.signed.append(args[-1])
+            return None
+        if args[0] == "verify":
+            self.verify_calls.append(args)
+            if args[-1] not in self.already_signed:
+                raise spack.util.executable.ProcessError("no signatures found")
+            return None
+        return super().__call__(*args, **kwargs)
+
+
+def test_keyless_push_does_not_sign_again_what_is_signed_by_the_expected_identity(
+    mutable_database, monkeypatch
+):
+    cosign = _SignedAs(_IDENTITY)
+    monkeypatch.setattr(spack.util.cosign, "_COSIGN", cosign)
+    monkeypatch.setattr(spack.util.cosign, "_COSIGN_MAJOR", None)
+    with oci_servers(InMemoryOCIRegistry("example.com")):
+        _keyless_mirror(identity=_IDENTITY, issuer=_ISSUER)
+        buildcache("push", "oci-test", "mpich")
+        first = len(cosign.signed)
+        assert first > 1
+
+        buildcache("push", "oci-test", "mpich")
+    assert len(cosign.signed) == first  # nothing signed twice
+
+
+def test_push_reports_failure_to_sign_existing_images_when_others_are_pushed(
+    mutable_database, monkeypatch
+):
+    """Some images are new and some already exist unsigned. A failure to sign the existing ones
+    must not be hidden because the new ones were pushed and signed."""
+    registry = InMemoryOCIRegistry("example.com")
+    denied = set()
+
+    class DeniesSome(_RecordingCosign):
+        def __call__(self, *args, **kwargs):
+            if args[0] == "sign" and args[-1] in denied:
+                raise spack.util.executable.ProcessError("denied-for-existing")
+            return super().__call__(*args, **kwargs)
+
+    cosign = DeniesSome()
+    monkeypatch.setattr(spack.util.cosign, "_COSIGN", cosign)
+    monkeypatch.setattr(spack.util.cosign, "_COSIGN_MAJOR", None)
+    with oci_servers(registry):
+        # libelf and its dependencies are in the registry, unsigned. mpich is not.
+        _push_unsigned_first(mutable_database, "libelf")
+        existing = {
+            "example.com/image@sha256:" + hashlib.sha256(registry.raw_manifests[key]).hexdigest()
+            for key in registry.manifests
+            if key[1].endswith(".spack")
+        }
+        assert existing
+        denied.update(existing)
+
+        spack.config.CONFIG.set(
+            "mirrors:oci-test",
+            {
+                "url": "oci://example.com/image",
+                "signed": {"method": "cosign", "key": "cosign.key"},
+            },
+            scope="user",
+        )
+        with pytest.raises(spack.error.SpackError, match="denied-for-existing"):
+            buildcache("push", "oci-test", "mpich")
+
+    # The new image was pushed and signed, so only the existing ones are in the error
+    assert cosign.signed, "nothing new was pushed, so this does not test mixed pushes"
+    assert not set(cosign.signed) & existing
