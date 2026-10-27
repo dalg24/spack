@@ -172,6 +172,26 @@ class Mirror:
         }
 
     @property
+    def unsupported_signing_request(self) -> Optional[str]:
+        """Why this mirror asks for signatures in a way that cannot be honored, or None.
+
+        GPG signatures do not exist for OCI registries, so ``signed: true`` on one used to be
+        ignored without a word. That is not good enough now that they can be signed with cosign:
+        someone who writes it believes the mirror is protected.
+        """
+        if (
+            is_oci_url(self.fetch_url)
+            and not isinstance(self._data, str)
+            and self._data.get("signed") is True
+        ):
+            return (
+                f"mirror {self.name or self.fetch_url} has `signed: true`, but OCI registries "
+                "are signed with cosign, not GPG. Configure a key, or the identity of the "
+                "signer: `signed: {method: cosign, key: ...}`, or remove `signed`."
+            )
+        return None
+
+    @property
     def signed(self) -> bool:
         if is_oci_url(self.fetch_url):
             # OCI images are signed with cosign, and only if that is configured
@@ -226,6 +246,9 @@ class Mirror:
         access_token_variable = self._get_value("access_token_variable", direction)
 
         errors = []
+
+        if self.unsupported_signing_request:
+            errors.append(self.unsupported_signing_request)
 
         if (
             not isinstance(self._data, str)

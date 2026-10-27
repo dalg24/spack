@@ -395,19 +395,24 @@ def test_best_effort_upload(mutable_database: spack.database.Database, monkeypat
 
 
 class _RecordingCosign:
-    def __init__(self, reject_verify: bool = False):
+    def __init__(self, reject_verify: bool = False, strict: bool = True):
         self.signed = []
         self.verified = []
         self.reject_verify = reject_verify
+        self.strict = strict
 
     def __call__(self, *args, **kwargs):
         if args[0] == "version":
             return "GitVersion:    v3.1.4\n"
-        if args[0] == "sign":
+        if args[0] == "public-key":
+            with open(args[args.index("--outfile") + 1], "w", encoding="utf-8") as f:
+                f.write("PUBLIC KEY")
+        elif args[0] == "sign":
             self.signed.append(args[-1])
         elif args[0] == "verify":
             self.verified.append(args[-1])
-            if self.reject_verify:
+            # Like a registry: only images that have been signed verify
+            if self.reject_verify or (self.strict and args[-1] not in self.signed):
                 raise spack.util.executable.ProcessError("no matching signatures")
 
 
@@ -742,58 +747,6 @@ def _push_unsigned_first(mutable_database, spec_str: str = "mpich"):
     buildcache("push", "oci-test", spec_str)
 
 
-def test_push_signs_images_that_were_pushed_unsigned(mutable_database, recording_cosign):
-    """A push must not skip images that exist but are unsigned, or a mirror that requires
-    signatures keeps images that clients refuse, whatever is pushed after."""
-    registry = InMemoryOCIRegistry("example.com")
-    with oci_servers(registry):
-        _push_unsigned_first(mutable_database)
-        assert not recording_cosign.signed
-
-        spack.config.CONFIG.set(
-            "mirrors:oci-test",
-            {
-                "url": "oci://example.com/image",
-                "signed": {"method": "cosign", "key": "cosign.key"},
-            },
-            scope="user",
-        )
-        buildcache("push", "oci-test", "mpich")
-
-    spec_tags = [tag for (_, tag) in registry.manifests if tag.endswith(".spack")]
-    assert len(recording_cosign.signed) == len(spec_tags) > 1
-    # What is signed is the manifest the registry serves, which is what clients verify
-    expected = {
-        "example.com/image@sha256:"
-        + hashlib.sha256(registry.raw_manifests[("image", tag)]).hexdigest()
-        for tag in spec_tags
-    }
-    assert set(recording_cosign.signed) == expected
-
-
-def test_push_that_cannot_sign_existing_images_fails(mutable_database, monkeypatch):
-    class Failing(_RecordingCosign):
-        def __call__(self, *args, **kwargs):
-            if args[0] == "sign":
-                raise spack.util.executable.ProcessError("denied")
-            return super().__call__(*args, **kwargs)
-
-    monkeypatch.setattr(spack.util.cosign, "_COSIGN", Failing())
-    monkeypatch.setattr(spack.util.cosign, "_COSIGN_MAJOR", None)
-    with oci_servers(InMemoryOCIRegistry("example.com")):
-        _push_unsigned_first(mutable_database)
-        spack.config.CONFIG.set(
-            "mirrors:oci-test",
-            {
-                "url": "oci://example.com/image",
-                "signed": {"method": "cosign", "key": "cosign.key"},
-            },
-            scope="user",
-        )
-        with pytest.raises(spack.error.SpackError, match="denied"):
-            buildcache("push", "oci-test", "mpich")
-
-
 def test_push_unsigned_still_skips_existing_images(mutable_database, recording_cosign):
     with oci_servers(InMemoryOCIRegistry("example.com")):
         _push_unsigned_first(mutable_database)
@@ -822,61 +775,123 @@ class _SignedAs(_KeylessCosign):
         return super().__call__(*args, **kwargs)
 
 
-def test_keyless_push_does_not_sign_again_what_is_signed_by_the_expected_identity(
-    mutable_database, monkeypatch
-):
-    cosign = _SignedAs(_IDENTITY)
-    monkeypatch.setattr(spack.util.cosign, "_COSIGN", cosign)
-    monkeypatch.setattr(spack.util.cosign, "_COSIGN_MAJOR", None)
+def test_signed_true_on_an_oci_mirror_cannot_be_pushed_to(mutable_database, recording_cosign):
+    """GPG signing does not exist for OCI registries. Silently ignoring `signed: true` leaves the
+    user believing the mirror is protected."""
     with oci_servers(InMemoryOCIRegistry("example.com")):
-        _keyless_mirror(identity=_IDENTITY, issuer=_ISSUER)
-        buildcache("push", "oci-test", "mpich")
-        first = len(cosign.signed)
-        assert first > 1
-
-        buildcache("push", "oci-test", "mpich")
-    assert len(cosign.signed) == first  # nothing signed twice
-
-
-def test_push_reports_failure_to_sign_existing_images_when_others_are_pushed(
-    mutable_database, monkeypatch
-):
-    """Some images are new and some already exist unsigned. A failure to sign the existing ones
-    must not be hidden because the new ones were pushed and signed."""
-    registry = InMemoryOCIRegistry("example.com")
-    denied = set()
-
-    class DeniesSome(_RecordingCosign):
-        def __call__(self, *args, **kwargs):
-            if args[0] == "sign" and args[-1] in denied:
-                raise spack.util.executable.ProcessError("denied-for-existing")
-            return super().__call__(*args, **kwargs)
-
-    cosign = DeniesSome()
-    monkeypatch.setattr(spack.util.cosign, "_COSIGN", cosign)
-    monkeypatch.setattr(spack.util.cosign, "_COSIGN_MAJOR", None)
-    with oci_servers(registry):
-        # libelf and its dependencies are in the registry, unsigned. mpich is not.
-        _push_unsigned_first(mutable_database, "libelf")
-        existing = {
-            "example.com/image@sha256:" + hashlib.sha256(registry.raw_manifests[key]).hexdigest()
-            for key in registry.manifests
-            if key[1].endswith(".spack")
-        }
-        assert existing
-        denied.update(existing)
-
         spack.config.CONFIG.set(
-            "mirrors:oci-test",
-            {
-                "url": "oci://example.com/image",
-                "signed": {"method": "cosign", "key": "cosign.key"},
-            },
-            scope="user",
+            "mirrors:oci-test", {"url": "oci://example.com/image", "signed": True}, scope="user"
         )
-        with pytest.raises(spack.error.SpackError, match="denied-for-existing"):
+        with pytest.raises(spack.error.SpackError, match="signed with cosign, not GPG"):
             buildcache("push", "oci-test", "mpich")
 
-    # The new image was pushed and signed, so only the existing ones are in the error
-    assert cosign.signed, "nothing new was pushed, so this does not test mixed pushes"
-    assert not set(cosign.signed) & existing
+
+def test_signed_true_on_an_oci_mirror_is_not_installed_from(mutable_database, recording_cosign):
+    with oci_servers(InMemoryOCIRegistry("example.com")):
+        spec = _push_with_key_then_uninstall(mutable_database)
+        spack.config.CONFIG.set(
+            "mirrors:oci-test", {"url": "oci://example.com/image", "signed": True}, scope="user"
+        )
+        with pytest.raises(RuntimeError, match="download of binary cache file"):
+            buildcache("install", "mpich")
+        # --unsigned is the explicit way to skip verification
+        buildcache("install", "--unsigned", "mpich")
+        assert mutable_database.installed(spec)
+
+
+@pytest.mark.parametrize("signed", [None, False])
+def test_oci_mirrors_without_signing_are_unchanged(mutable_database, recording_cosign, signed):
+    config = {"url": "oci://example.com/image"}
+    if signed is not None:
+        config["signed"] = signed
+    with oci_servers(InMemoryOCIRegistry("example.com")):
+        spack.config.CONFIG.set("mirrors:oci-test", config, scope="user")
+        buildcache("push", "--update-index", "oci-test", "mpich")
+        spec = mutable_database.query_local("mpich")[0]
+        spec.package.do_uninstall(force=True)
+        buildcache("install", "mpich")
+        assert mutable_database.installed(spec)
+    assert not recording_cosign.signed and not recording_cosign.verified
+
+
+def _signed_mirror(**signed):
+    spack.config.CONFIG.set(
+        "mirrors:oci-test",
+        {"url": "oci://example.com/image", "signed": {"method": "cosign", **signed}},
+        scope="user",
+    )
+
+
+def test_push_does_not_sign_images_it_did_not_create(mutable_database, recording_cosign):
+    """An image that is already in the registry may not be what this job built: it could have
+    been replaced by someone with access to the registry. Signing it would make clients trust it,
+    so it is left alone, and the user is told how to repair it."""
+    registry = InMemoryOCIRegistry("example.com")
+    with oci_servers(registry):
+        _push_unsigned_first(mutable_database)
+        _signed_mirror(key="cosign.key")
+        buildcache("push", "oci-test", "mpich")
+
+    assert not recording_cosign.signed
+
+
+def test_push_with_force_signs_the_images_it_uploads(mutable_database, recording_cosign):
+    """--force uploads the images of this job again, so those are the ones that get signed."""
+    registry = InMemoryOCIRegistry("example.com")
+    with oci_servers(registry):
+        _push_unsigned_first(mutable_database)
+        _signed_mirror(key="cosign.key")
+        buildcache("push", "--force", "oci-test", "mpich")
+
+    spec_tags = [tag for (_, tag) in registry.manifests if tag.endswith(".spack")]
+    assert len(recording_cosign.signed) == len(spec_tags) > 1
+    expected = {
+        "example.com/image@sha256:"
+        + hashlib.sha256(registry.raw_manifests[("image", tag)]).hexdigest()
+        for tag in spec_tags
+    }
+    assert set(recording_cosign.signed) == expected
+
+
+def test_push_that_skips_images_warns_when_signing(
+    mutable_database, recording_cosign, monkeypatch
+):
+    warnings = []
+    monkeypatch.setattr(spack.binary_distribution.tty, "warn", lambda *a, **k: warnings.append(a))
+    with oci_servers(InMemoryOCIRegistry("example.com")):
+        _push_unsigned_first(mutable_database)
+        _signed_mirror(key="cosign.key")
+        buildcache("push", "oci-test", "mpich")
+    assert any("not signed" in str(w) and "--force" in str(w) for w in warnings)
+
+
+def test_push_that_skips_images_does_not_warn_without_signing(
+    mutable_database, recording_cosign, monkeypatch
+):
+    warnings = []
+    monkeypatch.setattr(spack.binary_distribution.tty, "warn", lambda *a, **k: warnings.append(a))
+    with oci_servers(InMemoryOCIRegistry("example.com")):
+        _push_unsigned_first(mutable_database)
+        buildcache("push", "oci-test", "mpich")
+    assert not any("not signed" in str(w) for w in warnings)
+
+
+def test_install_goes_on_to_the_next_mirror_when_cosign_is_missing(mutable_database, monkeypatch):
+    """A mirror that cannot be verified because cosign is not available is skipped like one with
+    a bad signature, instead of aborting the install."""
+    import spack.bootstrap
+
+    with oci_servers(InMemoryOCIRegistry("example.com")):
+        monkeypatch.setattr(spack.util.cosign, "_COSIGN", _RecordingCosign())
+        monkeypatch.setattr(spack.util.cosign, "_COSIGN_MAJOR", None)
+        spec = _push_with_key_then_uninstall(mutable_database)
+
+        def cannot_bootstrap(*args, **kwargs):
+            raise RuntimeError("no network to build cosign")
+
+        monkeypatch.setattr(spack.util.cosign, "_COSIGN", None)
+        monkeypatch.setattr(spack.util.cosign, "_COSIGN_MAJOR", None)
+        monkeypatch.setattr(spack.bootstrap, "ensure_cosign_in_path_or_raise", cannot_bootstrap)
+        with pytest.raises(RuntimeError, match="download of binary cache file"):
+            buildcache("install", "mpich")
+        assert not mutable_database.installed(spec)

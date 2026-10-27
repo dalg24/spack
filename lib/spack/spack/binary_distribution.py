@@ -1498,42 +1498,6 @@ def _oci_get_blob_info(image_ref: ImageReference) -> Optional[spack.oci.oci.Blob
         return None
 
 
-def _oci_sign_existing(
-    target_image: ImageReference,
-    specs: List[spack.spec.Spec],
-    signing_key: Union[str, spack.util.cosign.KeylessSigner],
-) -> List[Tuple[spack.spec.Spec, BaseException]]:
-    """Sign images that are already in the registry and were not pushed by this call.
-
-    Skipping them would leave a mirror that requires signatures with images that clients refuse,
-    for example when signing failed after an earlier push, or was only set up afterwards.
-    """
-    errors: List[Tuple[spack.spec.Spec, BaseException]] = []
-    insecure_registry = target_image.scheme == "http"
-    for spec in specs:
-        ref = target_image.with_tag(_oci_default_tag(spec))
-        try:
-            # The digest that clients verify is the one of the manifest the registry serves
-            request = urllib.request.Request(
-                url=ref.manifest_url(),
-                headers={"Accept": ", ".join(spack.oci.oci.manifest_content_type)},
-            )
-            with spack.oci.opener.urlopen(request) as response:
-                digest = hashlib.sha256(response.read()).hexdigest()
-            image = f"{ref.domain}/{ref.name}@sha256:{digest}"
-
-            if isinstance(signing_key, spack.util.cosign.KeylessSigner):
-                if not signing_key.is_signed(image, insecure_registry):
-                    signing_key.sign(image, insecure_registry)
-            else:
-                spack.util.cosign.sign_image(
-                    image, signing_key, insecure_registry=insecure_registry
-                )
-        except Exception as e:
-            errors.append((spec, e))
-    return errors
-
-
 def _oci_push_pkg_blob(
     image_ref: ImageReference, spec: spack.spec.Spec, tmpdir: str
 ) -> Tuple[spack.oci.oci.Blob, float]:
@@ -1776,16 +1740,17 @@ def _oci_push(
     else:
         blobs_to_upload = installed_specs_with_deps
 
-    # Images that exist must still be signed if the mirror requires it
-    existing_errors: List[Tuple[spack.spec.Spec, BaseException]] = []
+    # Images that exist are skipped, and not signed: whatever is in the registry under the tag
+    # may not be what this job built, and signing it would make clients trust it. Say so, since
+    # a mirror that requires signatures would otherwise keep images that clients refuse.
     if skipped and signing_key:
-        tty.info(f"Signing {len(skipped)} existing image(s) in the buildcache")
-        existing_errors = _oci_sign_existing(target_image, skipped, signing_key)
-        failed_specs = {s.dag_hash() for s, _ in existing_errors}
-        skipped = [s for s in skipped if s.dag_hash() not in failed_specs]
+        tty.warn(
+            f"{len(skipped)} image(s) already in the buildcache were not signed, and clients "
+            "that verify signatures will refuse them. Use --force to push and sign them again."
+        )
 
     if not blobs_to_upload:
-        return skipped, base_images, checksums, existing_errors
+        return skipped, base_images, checksums, []
 
     if len(blobs_to_upload) != len(installed_specs_with_deps):
         tty.info(
@@ -1870,7 +1835,7 @@ def _oci_push(
             manifest_progress.fail()
             errors.append((spec, error))
 
-    return skipped, base_images, checksums, existing_errors + errors
+    return skipped, base_images, checksums, errors
 
 
 def _oci_config_from_tag(image_ref_and_tag: Tuple[ImageReference, str]) -> Optional[dict]:
@@ -2092,6 +2057,13 @@ def download_tarball(
 
             # Verify the signature of the exact bytes we got. The config and layer digests used
             # below come from this verified manifest, and are checksummed when fetched.
+            if mirror.unsupported_signing_request and not currently_unsigned:
+                # Installing from it unverified would silently ignore what the user asked for
+                tty.error(
+                    f"Not installing {spec.name}/{spec.dag_hash()[:7]} from {fetch_url}: "
+                    f"{mirror.unsupported_signing_request}"
+                )
+                continue
             if mirror.signed and not currently_unsigned:
                 manifest_digest = Digest.from_sha256(hashlib.sha256(manifest_bytes).hexdigest())
                 try:
